@@ -7,6 +7,10 @@ from scipy.stats import gamma, lognorm
 
 from .nhl_data import load_labs_for_date
 
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+DEFAULT_LABS_DIR = os.path.join(REPO_ROOT, "dk_data")
+
 def _sample_points(mean: float, vol: float, rng: np.random.Generator) -> float:
     """
     Simple mixture: mostly gamma around mean; volatility scales variance.
@@ -75,7 +79,8 @@ def simulate_lineups(lineups_csv: str,
 def main():
     ap = argparse.ArgumentParser(description="NHL lineup simulator (separate from NFL).")
     ap.add_argument("--lineups", required=True)
-    ap.add_argument("--labs-dir", required=True)
+    ap.add_argument("--labs-dir", default=DEFAULT_LABS_DIR,
+                    help="Folder with FantasyLabs NHL CSVs (default: %(default)s)")
     ap.add_argument("--date", required=True)
     ap.add_argument("--sims", type=int, default=10000)
     ap.add_argument("--out", required=True)
