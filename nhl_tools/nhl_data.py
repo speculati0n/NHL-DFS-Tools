@@ -4,7 +4,7 @@ from typing import Optional
 import pandas as pd
 
 def _to_int_or_none(x) -> Optional[int]:
-    if x is None or (isinstance(x, float) and pd.isna(x)): 
+    if x is None or (isinstance(x, float) and pd.isna(x)):
         return None
     s = str(x).strip().upper()
     m = re.search(r"(\d+)", s)
@@ -20,14 +20,11 @@ def _to_int_or_none(x) -> Optional[int]:
 
 def line_bucket(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalize EV/PP fields and build stack tags:
-      - EV_TAG = TEAM-L{1..4}
-      - PP_TAG = TEAM-PP{1..2}
-    Tags are only created for skaters (C/W/D). Goalies get None.
+    Normalize EV/PP fields and build stack tags for skaters:
+      EV_TAG = TEAM-L{1..4}, PP_TAG = TEAM-PP{1..2}
     """
     out = df.copy()
 
-    # Normalize numeric forms
     if "EV_Line" in out.columns:
         out["EV_Line"] = out["EV_Line"].map(_to_int_or_none)
     else:
@@ -45,22 +42,17 @@ def line_bucket(df: pd.DataFrame) -> pd.DataFrame:
     def _evrow(r):
         if not is_skater.iloc[r.name]:
             return None
-        tm = r.get("Team")
-        ln = r.get("EV_Line")
-        if tm is None or pd.isna(tm) or ln is None:
+        if pd.isna(r.get("Team")) or pd.isna(r.get("EV_Line")):
             return None
-        return f"{tm}-L{int(ln)}"
+        return f"{r['Team']}-L{int(r['EV_Line'])}"
 
     def _pprow(r):
         if not is_skater.iloc[r.name]:
             return None
-        tm = r.get("Team")
-        pu = r.get("PP_Unit")
-        if tm is None or pd.isna(tm) or pu is None:
+        if pd.isna(r.get("Team")) or pd.isna(r.get("PP_Unit")):
             return None
-        return f"{tm}-PP{int(pu)}"
+        return f"{r['Team']}-PP{int(r['PP_Unit'])}"
 
     out["EV_TAG"] = out.apply(_evrow, axis=1)
     out["PP_TAG"] = out.apply(_pprow, axis=1)
-
     return out
