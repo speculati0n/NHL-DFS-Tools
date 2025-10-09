@@ -1,6 +1,6 @@
 # nhl_tools/nhl_data.py
-import os, re, glob, csv
-from typing import Dict, List, Tuple
+import os, re, glob
+from typing import Dict, List, Tuple, Optional
 import pandas as pd
 import numpy as np
 
@@ -8,8 +8,8 @@ import numpy as np
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _pick(df: pd.DataFrame, *cands) -> str | None:
-    """Robust column picker (FantasyLabs drifts headers a bit)."""
+def _pick(df: pd.DataFrame, *cands) -> Optional[str]:
+    """Robust column picker (FantasyLabs headers drift)."""
     low = {c.lower(): c for c in df.columns}
     for c in cands:
         k = c.lower()
@@ -50,7 +50,7 @@ def _parse_full(s):
     if not m:
         return (None, None)
     line_no = int(m.group(1))
-    # try to infer F/D (skater type) when present
+    # try to infer F/D (skater type) when present (not required for optimizer)
     typ = None
     if "F" in t:
         typ = "F"
@@ -58,24 +58,23 @@ def _parse_full(s):
         typ = "D"
     return (typ, line_no)
 
-def _parse_pp(s):
-    """Parse PP unit like 'PP1', '1', 'PP 2'."""
+def _pp_to_int(s) -> Optional[int]:
+    """Normalize PP unit to integer (1/2) from 'PP1', '1', 'PP 2', etc."""
     if s is None or pd.isna(s):
         return None
-    t = str(s).upper()
-    m = re.search(r"PP\s*([12])", t)
-    if m:
-        return f"PP{m.group(1)}"
-    m = re.search(r"\b([12])\b", t)
-    if m:
-        return f"PP{m.group(1)}"
-    return None
+    t = str(s).strip().upper()
+    m = re.search(r"(\d+)", t)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
 
 def _read_csv_strict(path: str) -> pd.DataFrame:
     """
     Fallback reader for badly formatted CSVs (e.g., goalie files with extra commas).
-    We split each data line at most len(header)-1 times so any extra commas remain
-    in the last field, keeping column alignment.
+    Split each line at most len(header)-1 times so extra commas stay in the last field.
     """
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         lines = f.read().splitlines()
@@ -93,34 +92,26 @@ def _read_csv_strict(path: str) -> pd.DataFrame:
 
 def _read_labs_csv(path: str) -> pd.DataFrame:
     """
-    Read a Labs CSV with a robust fallback. We first try pandas normally.
-    If the data looks misaligned (e.g., Player is numeric or Salary mostly NaN),
-    we re-read via the strict splitter.
+    Read a Labs CSV with a robust fallback. First try pandas normally.
+    If the data looks misaligned (e.g., Player mostly numeric or Salary mostly NaN),
+    re-read via the strict splitter.
     """
     try:
         df = pd.read_csv(path)
     except Exception:
-        # catastrophically bad → strict
         return _read_csv_strict(path)
 
-    # Heuristics to detect misalignment
     looks_bad = False
-
     if "Player" in df.columns:
-        # If Player is mostly numeric, it's misparsed.
         s = df["Player"].dropna().head(5)
-        if not s.empty and all(pd.api.types.is_numeric_dtype(type(x)) or isinstance(x, (int, float)) for x in s):
+        if not s.empty and all(str(x).strip().replace(".", "", 1).isdigit() for x in s):
             looks_bad = True
-
     if "Salary" in df.columns:
-        # If Salary is mostly NaN, it's suspicious (esp. goalie files).
         na_ratio = df["Salary"].isna().mean()
         if na_ratio > 0.6:
             looks_bad = True
-
     if looks_bad:
         df = _read_csv_strict(path)
-
     return df
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -174,8 +165,14 @@ def load_labs_for_date(stats_dir: str, ymd: str) -> pd.DataFrame:
         })
 
         # derived EV / PP features
-        out["EV_Type"], out["EV_Line"] = zip(*out["FullRaw"].map(_parse_full)) if "FullRaw" in out else (None, None)
-        out["PP_Unit"] = out["PP"].map(_parse_pp) if "PP" in out else None
+        if "FullRaw" in out:
+            ev_type, ev_line = zip(*out["FullRaw"].map(_parse_full))
+            out["EV_Type"] = list(ev_type)
+            out["EV_Line"] = list(ev_line)
+        else:
+            out["EV_Type"], out["EV_Line"] = (None, None)
+
+        out["PP_Unit"] = out["PP"].map(_pp_to_int) if "PP" in out else None  # ← normalize to ints 1/2
 
         # canonical single-pos from FantasyLabs file name
         base = os.path.basename(fp).upper()
@@ -184,11 +181,15 @@ def load_labs_for_date(stats_dir: str, ymd: str) -> pd.DataFrame:
         elif "_NHL_D_" in base: out["PosCanon"] = "D"
         elif "_NHL_G_" in base: out["PosCanon"] = "G"
         else:
-            # fallback: try to read from Pos column
             if c_pos:
                 out["PosCanon"] = df[c_pos].astype(str).str.extract(r"(C|W|D|G)")[0]
             else:
                 out["PosCanon"] = None
+
+        # Ensure all expected columns exist (avoids concat all-NA warnings in newer pandas)
+        for col in ["Opp", "Own", "FullRaw", "EV_Type", "EV_Line", "PP", "PP_Unit", "PosCanon"]:
+            if col not in out.columns:
+                out[col] = np.nan
 
         parts.append(out)
 
@@ -199,18 +200,4 @@ def load_labs_for_date(stats_dir: str, ymd: str) -> pd.DataFrame:
     full = full.dropna(subset=["Team", "Salary", "Proj", "PosCanon"])
     full = full.drop_duplicates(subset=["Name", "Team", "PosCanon"], keep="first").reset_index(drop=True)
 
-    # Game key for bring-backs
-    def _gk(row):
-        a, b = sorted([row["Team"], row["Opp"]]) if row["Opp"] and row["Opp"] != "None" else (row["Team"], None)
-        return f"{a}@{b}" if b else None
-
-    full["GameKey"] = full.apply(_gk, axis=1)
-
-    # sanity flags
-    full["IsSkater"] = full["PosCanon"].isin(["C", "W", "D"])
-    full["IsGoalie"] = (full["PosCanon"] == "G")
-    return full
-
-# DK rules
-DK_ROSTER = dict(C=2, W=3, D=2, G=1, UTIL=1)
-DK_SALARY_CAP = 50000
+    # Game key for bring
