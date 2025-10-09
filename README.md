@@ -45,3 +45,19 @@ We read: Player, Team, Opp, Salary, Proj (and optionally Own), Full, PP.
 ## Consistency / Upside / Duds
 Objective:  Score = Proj * (1 + w_up*UpsideZ) * (1 + w_con*ConsistencyZ) - w_dud*DudPenalty
 Tune via CLI flags: --w-up, --w-con, --w-dud, --ceil-mult, --floor-mult.
+
+## Optimizer configuration
+
+`cli/nhl_opt.py` loads settings from `configs/optimizer.yaml` (falls back to
+`configs/optimizer.example.yaml`).  The YAML controls ownership efficiency,
+random under-spend, correlation bonuses, and lineup uniqueness.  Any CLI
+override takes precedence over the config for that key (for example
+`--leftover-mode mix`).
+
+Example runs:
+
+```
+python cli/nhl_opt.py --date 2021-10-15 --num-lineups 50
+python cli/nhl_opt.py --date 2021-10-15 --num-lineups 150 --leftover-mode aggressive --min-uniques 3 --seed 1337
+python cli/nhl_opt.py --date 2021-10-15 --num-lineups 100 --total-own-max 120 --w-eff 0.45
+```
