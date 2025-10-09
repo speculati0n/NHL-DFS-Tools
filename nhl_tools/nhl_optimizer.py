@@ -33,6 +33,51 @@ def add_quality_columns(df: pd.DataFrame,
     return out
 
 # ---------- linear optimizer per lineup ----------
+def _flatten_history_entry(entry):
+    """Yield scalar items from possibly nested history containers."""
+    if entry is None:
+        return
+    if isinstance(entry, (pd.Series, np.ndarray)):
+        entry = entry.tolist()
+    if isinstance(entry, (set, list, tuple)):
+        for sub in entry:
+            yield from _flatten_history_entry(sub)
+    else:
+        yield entry
+
+
+def _normalise_history(df: pd.DataFrame, idx: range, diversify_with):
+    """Convert historical lineup representations into skater index sets."""
+    if not diversify_with:
+        return
+
+    if isinstance(diversify_with, (list, tuple, set)):
+        raw_history = list(diversify_with)
+    else:
+        raw_history = [diversify_with]
+
+    name_to_idx: dict[str, set[int]] = {}
+    for i in idx:
+        if df.loc[i, "PosCanon"] == "G":
+            continue
+        name_to_idx.setdefault(str(df.loc[i, "Name"]), set()).add(i)
+
+    for prev in raw_history:
+        forbid_idx: set[int] = set()
+        for item in _flatten_history_entry(prev):
+            if isinstance(item, (int, np.integer)):
+                j = int(item)
+                if 0 <= j < len(df) and df.loc[j, "PosCanon"] != "G":
+                    forbid_idx.add(j)
+            elif isinstance(item, str):
+                forbid_idx.update(name_to_idx.get(item, set()))
+            elif isinstance(item, tuple) and item:
+                name = str(item[0])
+                forbid_idx.update(name_to_idx.get(name, set()))
+        if forbid_idx:
+            yield forbid_idx
+
+
 def solve_single_lineup(players: pd.DataFrame,
                         w_up: float, w_con: float, w_dud: float,
                         min_salary: int, max_vs_goalie: int,
