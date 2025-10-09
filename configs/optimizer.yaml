@@ -1,0 +1,45 @@
+# NHL-DFS-Tools Optimizer Config
+
+random:
+  seed: 42               # global default seed (CLI can override)
+  objective_noise_std: 0.003   # gaussian jitter added to each x_i in objective
+  weight_jitter_pct: 0.10      # ± % jitter applied to weights below, per lineup
+  leftover_mode: mix           # one of: none | light | mix | aggressive
+  # Salary leftover buckets chosen per lineup, based on leftover_mode:
+  leftover_buckets:
+    none:        [0]
+    light:       [0, 100]
+    mix:         [0, 100, 200]
+    aggressive:  [0, 100, 200, 500]
+
+ownership:
+  enabled: true          # auto-disables if Own column missing or mostly NaN
+  total_own_max: 130.0   # cap on sum of ownership (percent units)
+  chalk_thresh: 20.0     # projected ownership threshold (percent)
+  max_chalk: 2           # max number of chalk players
+  # Efficiency metric weight (ProjPerOwn z-score). 0 disables.
+  w_eff: 0.25
+
+correlation:
+  # Soft bonuses, added to objective via activation binaries
+  w_ev_stack_3p: 0.60    # EV even-strength stacks (3+)
+  w_pp1_stack_3p: 0.50   # PP1 stacks (3+)
+  bringbacks_max: 1      # hard cap on bring-backs
+  max_skaters_vs_goalie: 0  # hard cap skaters vs own goalie
+
+salary:
+  # min salary = cap - (random choice from leftover_buckets[mode])
+  enforce_min: true
+
+uniqueness:
+  min_uniques: 2         # Hamming distance: differ by at least N players vs each prior lineup
+
+projection:
+  # Existing components: projection, upside/consistency multipliers, dud penalty
+  # Keep exactly as-is in your code, just combine with new terms.
+  keep_legacy_terms: true
+
+# If we lack Own, treat these as no-ops but still run.
+fallback_if_no_own:
+  disable_ownership_terms: true
+  max_chalk_when_no_own: 9   # effectively no cap
