@@ -65,9 +65,16 @@ def solve_single_lineup(players: pd.DataFrame,
     prob += lpSum(x[i] * int(df.loc[i,"Salary"]) for i in idx) >= int(min_salary)
 
     # roster counts
-    prob += lpSum(x[i] for i in C) == DK_ROSTER["C"]
-    prob += lpSum(x[i] for i in W) == DK_ROSTER["W"]
-    prob += lpSum(x[i] for i in D) == DK_ROSTER["D"]
+    # DraftKings uses an eight-player positional core (2C/3W/2D/1G) plus a UTIL
+    # skater.  The FantasyLabs exports only list a single canonical position per
+    # player, so the UTIL spot must be satisfied by exceeding one of the skater
+    # minimums rather than relying on multi-position eligibility.  Using equality
+    # for the skater counts makes the model infeasible because 2+3+2+1=8 while we
+    # also demand nine total players.  Relax the skater constraints to minimums
+    # while keeping the goalie exact and the overall roster size at nine.
+    prob += lpSum(x[i] for i in C) >= DK_ROSTER["C"]
+    prob += lpSum(x[i] for i in W) >= DK_ROSTER["W"]
+    prob += lpSum(x[i] for i in D) >= DK_ROSTER["D"]
     prob += lpSum(x[i] for i in G) == DK_ROSTER["G"]
     prob += lpSum(x[i] for i in idx) == sum(DK_ROSTER.values())  # total 9
 
