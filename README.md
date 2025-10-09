@@ -23,6 +23,22 @@ python cli/nhl_sim.py ^
   --sims 20000 ^
   --out "out/sim_report_2021-10-13.csv"
 
+### DraftKings Export (NHL)
+
+Export optimizer lineups to DraftKings upload format with player IDs mapped:
+
+```
+python cli/nhl_export_dk.py \
+  --lineups out/lineups_2025-10-09.csv \
+  --player-ids dk_data/player_ids.csv \
+  --out out/dk_upload_2025-10-09.csv
+```
+
+Output columns: `C1,C2,W1,W2,W3,D1,D2,G,UTIL`
+Each cell is formatted as `Player Name (PLAYERID)`.
+If an ID can't be found, the exporter writes `Player Name ()` and logs the row to `out/unmatched_players.csv`.
+Use `--strict` to fail when any player cannot be mapped.
+
 ## FantasyLabs inputs
 By default the CLIs look for FantasyLabs exports inside the repository's `dk_data` folder.
 Populate that directory (or point `--labs-dir` elsewhere) with these four files for the slate date:
