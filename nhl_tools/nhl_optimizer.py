@@ -232,7 +232,12 @@ def solve_single_lineup(players: pd.DataFrame,
 
     # diversification (soft): forbid all players from previous lineup
     if diversify > 0 and diversify_with:
-
+        history_sets = list(_normalise_history(df, idx, diversify_with))
+        for j, forbid in enumerate(history_sets, start=1):
+            if not forbid:
+                continue
+            overlap_cap = max(len(forbid) - int(diversify), 0)
+            prob += lpSum(x[i] for i in forbid) <= overlap_cap, f"diversify_{j}"
 
     # solve
     status = prob.solve(PULP_CBC_CMD(msg=False))
@@ -254,6 +259,7 @@ def build_lineups(df: pd.DataFrame, n: int,
     """
     players = add_quality_columns(df)
     outs = []
+    history: list[list[int]] = []
 
     for k in range(n):
         ok, idxs = solve_single_lineup(
@@ -282,6 +288,9 @@ def build_lineups(df: pd.DataFrame, n: int,
         lineup["LineupID"] = k+1
         lineup["Slot"] = (["C1","C2","W1","W2","W3","D1","D2","G","UTIL"])[:len(lineup)]
         outs.append(lineup)
+
+        if diversify > 0:
+            history.append([int(i) for i in idxs])
 
     if outs:
         return pd.concat(outs, ignore_index=True)
