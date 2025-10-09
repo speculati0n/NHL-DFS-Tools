@@ -187,60 +187,7 @@ def solve_single_lineup(players: pd.DataFrame,
 
     # diversification (soft): forbid all players from previous lineup
     if diversify > 0 and diversify_with:
-        # Accept multiple historical lineups and normalise them into skater indices.
-        if not isinstance(diversify_with, (list, tuple)):
-            raw_history = [diversify_with]
-        else:
-            raw_history = list(diversify_with)
 
-        # Map player names to candidate indices once so we can translate
-        # older history formats that stored names instead of row ids.
-        name_to_idx: dict[str, set[int]] = {}
-        for i in idx:
-            if df.loc[i, "PosCanon"] == "G":
-                continue
-            name_to_idx.setdefault(str(df.loc[i, "Name"]), set()).add(i)
-
-        for prev in raw_history:
-            if not prev:
-                continue
-
-            # Normalise the lineup representation into a set of DataFrame indices.
-            if isinstance(prev, (set, list, tuple)) and prev and not isinstance(next(iter(prev)), (list, tuple, set)):
-                items = list(prev)
-            elif isinstance(prev, (set, list, tuple)):
-                # Guard against nested history like [[...], [...]] where `prev`
-                # may itself be a list of players.
-                items = []
-                for chunk in prev:
-                    if not chunk:
-                        continue
-                    if isinstance(chunk, (set, list, tuple)):
-                        items.extend(chunk)
-                    else:
-                        items.append(chunk)
-            else:
-                items = [prev]
-
-            forbid_idx: set[int] = set()
-            for item in items:
-                if isinstance(item, (int, np.integer)):
-                    j = int(item)
-                    if 0 <= j < N and df.loc[j, "PosCanon"] != "G":
-                        forbid_idx.add(j)
-                elif isinstance(item, str):
-                    forbid_idx.update(name_to_idx.get(item, set()))
-                else:
-                    # Support (name, team) tuples to reduce ambiguity if provided.
-                    if isinstance(item, tuple) and item:
-                        name = str(item[0])
-                        forbid_idx.update(name_to_idx.get(name, set()))
-
-            if not forbid_idx:
-                continue
-
-            limit = max(0, len(forbid_idx) - int(diversify))
-            prob += lpSum(x[i] for i in forbid_idx) <= limit
 
     # solve
     status = prob.solve(PULP_CBC_CMD(msg=False))
@@ -262,7 +209,7 @@ def build_lineups(df: pd.DataFrame, n: int,
     """
     players = add_quality_columns(df)
     outs = []
-    history: list[list[int]] = []
+
     for k in range(n):
         ok, idxs = solve_single_lineup(
             players, w_up, w_con, w_dud, min_salary, max_vs_goalie,
@@ -290,7 +237,7 @@ def build_lineups(df: pd.DataFrame, n: int,
         lineup["LineupID"] = k+1
         lineup["Slot"] = (["C1","C2","W1","W2","W3","D1","D2","G","UTIL"])[:len(lineup)]
         outs.append(lineup)
-        history.append([int(i) for i in idxs if players.loc[i, "PosCanon"] != "G"])
+
     if outs:
         return pd.concat(outs, ignore_index=True)
     return pd.DataFrame()
