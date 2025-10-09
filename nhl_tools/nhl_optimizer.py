@@ -147,18 +147,30 @@ def solve_single_lineup(players: pd.DataFrame,
 
     # BringBack_1+ (game-level approximation)
     # If we have a team with >=2 skaters in game g, require >=1 skater from its opponent (for y_bb_g=1).
-    games = sorted(df.dropna(subset=["GameKey"]).loc[df["PosCanon"]!="G","GameKey"].unique().tolist())
-    y_bb = [LpVariable(f"y_bb_{g}",0,1,LpBinary) for g in games]
-    for g, y in zip(games, y_bb):
-        a,b = g.split("@")
-        A = [i for i in SK if df.loc[i,"Team"]==a]
-        B = [i for i in SK if df.loc[i,"Team"]==b]
-        # if either side has a 2+ mini-stack, force at least 1 from the other
-        prob += lpSum(x[i] for i in A) >= 2*y
-        prob += lpSum(x[i] for i in B) >= 1*y
-        # symmetrical: flip roles
-        prob += lpSum(x[i] for i in B) + 0 >= 2*y
-        prob += lpSum(x[i] for i in A) + 0 >= 1*y
+    games = game_pairs(df)
+    y_bb = [LpVariable(f"y_bb_{a}_{b}", 0, 1, LpBinary) for a, b in games]
+    y_stack_a = [LpVariable(f"y_stack_{a}_{b}_{a}", 0, 1, LpBinary) for a, b in games]
+    y_stack_b = [LpVariable(f"y_stack_{a}_{b}_{b}", 0, 1, LpBinary) for a, b in games]
+    for (a, b), y_game, ya, yb in zip(games, y_bb, y_stack_a, y_stack_b):
+        A = [i for i in SK if str(df.loc[i, "Team"]).upper() == a]
+        B = [i for i in SK if str(df.loc[i, "Team"]).upper() == b]
+        if not A or not B:
+            # Without skaters from both teams, the bring-back constraint is moot.
+            prob += y_game == 0
+            prob += ya == 0
+            prob += yb == 0
+            continue
+
+        prob += lpSum(x[i] for i in A) >= 2 * ya
+        prob += lpSum(x[i] for i in B) >= ya
+
+        prob += lpSum(x[i] for i in B) >= 2 * yb
+        prob += lpSum(x[i] for i in A) >= yb
+
+        # tie the game activation to either side triggering the condition
+        prob += y_game <= ya + yb
+        prob += y_game >= ya
+        prob += y_game >= yb
     prob += lpSum(y_bb) >= int(need_bringback)
 
     # diversification (soft): forbid all players from previous lineup
