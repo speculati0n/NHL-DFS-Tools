@@ -1,199 +1,110 @@
-# nhl_tools/nhl_data.py
-import os, re, glob
-from typing import Optional
+import re
+from typing import Dict, Iterable, List, Optional
+
 import pandas as pd
-import numpy as np
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _pick(df: pd.DataFrame, *cands) -> Optional[str]:
-    """Robust column picker (FantasyLabs headers drift)."""
-    low = {c.lower(): c for c in df.columns}
-    for c in cands:
-        k = c.lower()
-        if k in low:
-            return low[k]
-    return None
 
-def _coerce_num(s):
-    if s is None: return None
-    if pd.isna(s): return None
-    if isinstance(s, (int, float)):
+def _to_int_or_none(x) -> Optional[int]:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return None
+    s = str(x).strip().upper()
+    m = re.search(r"(\d+)", s)
+    if m:
         try:
-            return int(s)
+            return int(m.group(1))
         except Exception:
-            try:
-                return float(s)
-            except Exception:
-                return None
-    m = re.sub(r"[^\d.\-]", "", str(s))  # strip $, commas, spaces etc.
-    if m in ("", "-", "--"): return None
+            return None
     try:
-        if "." in m:
-            v = float(m)
-            return int(v) if v.is_integer() else v
-        return int(m)
+        return int(float(s))
     except Exception:
         return None
 
-def _parse_full(s):
-    """Parse FantasyLabs Full/Line column (EV lines) into (type, line_no)."""
-    if s is None or pd.isna(s):
-        return (None, None)
-    t = str(s).strip().upper()
-    m = re.search(r"(?:L)?\s*(\d)", t)  # L1 / 1 / EV 1 etc.
-    if not m:
-        return (None, None)
-    line_no = int(m.group(1))
-    typ = None
-    if "F" in t: typ = "F"
-    elif "D" in t: typ = "D"
-    return (typ, line_no)
-
-def _pp_to_int(s) -> Optional[int]:
-    """Normalize PP unit to integer (1/2) from 'PP1', '1', 'PP 2', etc."""
-    if s is None or pd.isna(s): return None
-    t = str(s).strip().upper()
-    m = re.search(r"(\d+)", t)
-    if not m: return None
-    try:
-        return int(m.group(1))
-    except Exception:
-        return None
-
-def _read_csv_strict(path: str) -> pd.DataFrame:
-    """
-    Fallback reader for badly formatted CSVs (e.g., goalie files with extra commas).
-    Split each data line at most len(header)-1 times so extra commas stay in the last field.
-    """
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        lines = f.read().splitlines()
-    if not lines:
-        return pd.DataFrame()
-    header = lines[0].split(",")
-    n = len(header)
-    rows = []
-    for ln in lines[1:]:
-        parts = ln.split(",", n - 1)
-        if len(parts) < n:
-            parts += [""] * (n - len(parts))
-        rows.append(parts[:n])
-    return pd.DataFrame(rows, columns=header)
-
-def _read_labs_csv(path: str) -> pd.DataFrame:
-    """Read a Labs CSV with a robust fallback."""
-    try:
-        df = pd.read_csv(path)
-    except Exception:
-        return _read_csv_strict(path)
-
-    looks_bad = False
-    if "Player" in df.columns:
-        s = df["Player"].dropna().head(5)
-        if not s.empty and all(str(x).strip().replace(".", "", 1).isdigit() for x in s):
-            looks_bad = True
-    if "Salary" in df.columns and df["Salary"].isna().mean() > 0.6:
-        looks_bad = True
-    if looks_bad:
-        df = _read_csv_strict(path)
-    return df
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Public API
 # ──────────────────────────────────────────────────────────────────────────────
 
-def load_labs_for_date(stats_dir: str, ymd: str) -> pd.DataFrame:
-    """
-    Read FantasyLabs NHL CSVs for a single date (YYYY-MM-DD).
-    Expected files in stats_dir:
-      fantasylabs_player_data_NHL_[C|W|D|G]_YYYYMMDD.csv
-    """
-    ymd_compact = ymd.replace("-", "")
-    fps = []
-    for pos in ["C", "W", "D", "G"]:
-        pat = os.path.join(stats_dir, f"fantasylabs_player_data_NHL_{pos}_{ymd_compact}.csv")
-        matches = glob.glob(pat)
-        if not matches:
-            raise FileNotFoundError(f"Missing Labs file for position {pos}: {pat}")
-        fps.extend(matches)
 
-    parts = []
-    for fp in fps:
-        df = _read_labs_csv(fp)
+def line_bucket(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize EV/PP fields and build stack tags for skaters."""
 
-        c_player = _pick(df, "Player", "Name")
-        c_pos    = _pick(df, "Pos", "Position")
-        c_team   = _pick(df, "Team", "Tm")
-        c_opp    = _pick(df, "Opp", "Opponent")
-        c_sal    = _pick(df, "Salary", "Sal")
-        c_proj   = _pick(df, "Proj", "Projection", "My Proj", "My")
-        c_own    = _pick(df, "Own", "Ownership", "Proj Own", "My Own", "Ownership%", "Own%")
-        c_full   = _pick(df, "Full", "Even Strength Line", "EV Line", "Line")
-        c_pp     = _pick(df, "PP", "Power Play", "PP Unit")
+    out = df.copy()
 
-        if not c_player or not c_team or not c_sal or not c_proj:
-            raise ValueError(
-                f"Missing required columns in {os.path.basename(fp)} — "
-                f"need Player/Team/Salary/Proj-like columns; got: {list(df.columns)[:10]}..."
-            )
+    if "EV_Line" in out.columns:
+        out["EV_Line"] = out["EV_Line"].map(_to_int_or_none)
+    else:
+        out["EV_Line"] = None
 
-        out = pd.DataFrame({
-            "Name":   df[c_player].astype(str).str.strip(),
-            "Team":   df[c_team].astype(str).str.strip(),
-            "Opp":    df[c_opp].astype(str).str.strip() if c_opp else np.nan,
-            "Salary": df[c_sal].map(_coerce_num),
-            "Proj":   df[c_proj].map(_coerce_num),
-            "Own":    df[c_own].map(_coerce_num) if c_own else np.nan,
-            "FullRaw": df[c_full] if c_full else np.nan,
-            "PP":     df[c_pp] if c_pp else np.nan,
-        })
+    if "PP_Unit" in out.columns:
+        out["PP_Unit"] = out["PP_Unit"].map(_to_int_or_none)
+    else:
+        out["PP_Unit"] = None
 
-        # derived EV / PP features
-        ev_type, ev_line = zip(*out["FullRaw"].map(_parse_full)) if "FullRaw" in out else ([], [])
-        out["EV_Type"] = list(ev_type)
-        out["EV_Line"] = list(ev_line)
-        out["PP_Unit"] = out["PP"].map(_pp_to_int)
+    if "PosCanon" not in out.columns:
+        out["PosCanon"] = None
+    is_skater = out["PosCanon"].isin(["C", "W", "D"])
 
-        # canonical single-pos from FantasyLabs file name
-        base = os.path.basename(fp).upper()
-        if "_NHL_C_" in base: out["PosCanon"] = "C"
-        elif "_NHL_W_" in base: out["PosCanon"] = "W"
-        elif "_NHL_D_" in base: out["PosCanon"] = "D"
-        elif "_NHL_G_" in base: out["PosCanon"] = "G"
-        else:
-            if c_pos:
-                out["PosCanon"] = df[c_pos].astype(str).str.extract(r"(C|W|D|G)")[0]
-            else:
-                out["PosCanon"] = np.nan
+    def _evrow(r):
+        if not is_skater.iloc[r.name]:
+            return None
+        if pd.isna(r.get("Team")) or pd.isna(r.get("EV_Line")):
+            return None
+        return f"{r['Team']}-L{int(r['EV_Line'])}"
 
-        # Ensure expected columns exist (avoid concat-NA warning in new pandas)
-        for col in ["Opp", "Own", "FullRaw", "EV_Type", "EV_Line", "PP", "PP_Unit", "PosCanon"]:
-            if col not in out.columns:
-                out[col] = np.nan
+    def _pprow(r):
+        if not is_skater.iloc[r.name]:
+            return None
+        if pd.isna(r.get("Team")) or pd.isna(r.get("PP_Unit")):
+            return None
+        return f"{r['Team']}-PP{int(r['PP_Unit'])}"
 
-        parts.append(out)
+    out["EV_TAG"] = out.apply(_evrow, axis=1)
+    out["PP_TAG"] = out.apply(_pprow, axis=1)
+    return out
 
-    full = pd.concat(parts, ignore_index=True)
 
-    # Basic sanity
-    full = full.dropna(subset=["Team", "Salary", "Proj", "PosCanon"])
-    full = full.drop_duplicates(subset=["Name", "Team", "PosCanon"], keep="first").reset_index(drop=True)
+def _collect_members(df: pd.DataFrame, tag_col: str, min_size: int) -> Dict[str, List[str]]:
+    if tag_col not in df.columns:
+        return {}
 
-    # Game key for bring-backs
-    def _gk(row):
-        if pd.notna(row["Opp"]) and row["Opp"] != "None":
-            a, b = sorted([str(row["Team"]), str(row["Opp"])])
-            return f"{a}@{b}"
-        return None
-    full["GameKey"] = full.apply(_gk, axis=1)
+    tagged = df.dropna(subset=[tag_col])
+    if "IsSkater" in tagged.columns:
+        tagged = tagged[tagged["IsSkater"].astype(bool)]
 
-    # flags
-    full["IsSkater"] = full["PosCanon"].isin(["C", "W", "D"])
-    full["IsGoalie"] = (full["PosCanon"] == "G")
-    return full
+    groups: Dict[str, List[str]] = {}
+    for tag, grp in tagged.groupby(tag_col):
+        members = grp["Name"].astype(str).tolist()
+        if len(members) >= min_size:
+            groups[str(tag)] = members
+    return groups
 
-# DK rules (imported by optimizer)
-DK_ROSTER = dict(C=2, W=3, D=2, G=1, UTIL=1)
-DK_SALARY_CAP = 50000
+
+def group_line_members(
+    df: pd.DataFrame,
+    tags: Iterable[str] = ("EV_TAG", "PP_TAG"),
+    *,
+    min_size: int = 2,
+) -> Dict[str, Dict[str, List[str]]]:
+    """Return line/PP groupings keyed by tag column."""
+
+    out: Dict[str, Dict[str, List[str]]] = {}
+    for col in tags:
+        members = _collect_members(df, col, min_size)
+        if members:
+            out[col] = members
+    return out
+
+
+def game_pairs(df: pd.DataFrame) -> List[str]:
+    """Return sorted game keys present in the player pool."""
+
+    if "GameKey" not in df.columns:
+        return []
+    games = df.dropna(subset=["GameKey"])["GameKey"].unique().tolist()
+    games = [str(g) for g in games]
+    return sorted(games)
