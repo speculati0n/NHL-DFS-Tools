@@ -40,7 +40,8 @@ def solve_single_lineup(players: pd.DataFrame,
                         need_pp1_2: int, need_pp1_3: int, need_pp2_2: int,
                         need_same2: int, need_same3: int, need_same4: int, need_same5: int,
                         need_bringback: int,
-                        diversify_with: list[str] | None = None) -> Tuple[bool, List[int]]:
+                        diversify: int,
+                        diversify_with: list[list[str]] | list[str] | None = None) -> Tuple[bool, List[int]]:
     """
     Build one DK lineup. Returns (ok, idx_list)
     """
@@ -185,11 +186,19 @@ def solve_single_lineup(players: pd.DataFrame,
     prob += lpSum(y_bb) >= int(need_bringback)
 
     # diversification (soft): forbid all players from previous lineup
-    if diversify_with:
-        prev = set(diversify_with)
-        forbid = [i for i in idx if df.loc[i,"Name"] in prev and df.loc[i,"PosCanon"]!="G"]
-        if forbid:
-            prob += lpSum(x[i] for i in forbid) <= max(0, len(forbid)-1)  # at least one change
+    if diversify > 0 and diversify_with:
+        # Accept either a single list of names (legacy behavior) or
+        # multiple historical lineups to avoid repeating any of them.
+        if diversify_with and isinstance(diversify_with[0], str):  # type: ignore[index]
+            history = [set(diversify_with)]  # type: ignore[list-item]
+        else:
+            history = [set(names) for names in diversify_with if names]  # type: ignore[union-attr]
+
+        for prev in history:
+            forbid = [i for i in idx if df.loc[i, "Name"] in prev and df.loc[i, "PosCanon"] != "G"]
+            if forbid:
+                limit = max(0, len(forbid) - int(diversify))
+                prob += lpSum(x[i] for i in forbid) <= limit
 
     # solve
     status = prob.solve(PULP_CBC_CMD(msg=False))
@@ -211,14 +220,15 @@ def build_lineups(df: pd.DataFrame, n: int,
     """
     players = add_quality_columns(df)
     outs = []
-    prev_names = []
+    history: list[list[str]] = []
     for k in range(n):
         ok, idxs = solve_single_lineup(
             players, w_up, w_con, w_dud, min_salary, max_vs_goalie,
             need_ev2, need_ev3, need_pp1_2, need_pp1_3, need_pp2_2,
             need_same2, need_same3, need_same4, need_same5,
             need_bringback,
-            diversify_with=(prev_names if diversify>0 else None)
+            diversify,
+            diversify_with=(history if diversify>0 else None)
         )
         if not ok: break
         chosen = players.loc[idxs].copy()
@@ -238,7 +248,7 @@ def build_lineups(df: pd.DataFrame, n: int,
         lineup["LineupID"] = k+1
         lineup["Slot"] = (["C1","C2","W1","W2","W3","D1","D2","G","UTIL"])[:len(lineup)]
         outs.append(lineup)
-        prev_names = lineup["Name"].tolist()
+        history.append(lineup[lineup["PosCanon"] != "G"]["Name"].tolist())
     if outs:
         return pd.concat(outs, ignore_index=True)
     return pd.DataFrame()
