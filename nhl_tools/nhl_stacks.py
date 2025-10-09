@@ -48,7 +48,7 @@ def line_bucket(df: pd.DataFrame) -> pd.DataFrame:
     if "PosCanon" not in out.columns:
         out["PosCanon"] = None
     is_skater = out["PosCanon"].isin(["C", "W", "D"])
-    out["IsSkater"] = is_skater.astype(bool)
+
 
     def _evrow(r):
         if not is_skater.iloc[r.name]:
@@ -65,8 +65,7 @@ def line_bucket(df: pd.DataFrame) -> pd.DataFrame:
         return f"{r['Team']}-PP{int(r['PP_Unit'])}"
 
     out["EV_TAG"] = out.apply(_evrow, axis=1)
-    # legacy column name expected by optimizer/output code
-    out["EV_LINE_TAG"] = out["EV_TAG"]
+
     out["PP_TAG"] = out.apply(_pprow, axis=1)
     return out
 
@@ -103,26 +102,4 @@ def group_line_members(
     return out
 
 
-def game_pairs(df: pd.DataFrame) -> List[tuple[str, str]]:
-    """Return sorted team matchups present in the player pool."""
 
-    if "Team" not in df.columns or "Opp" not in df.columns:
-        return []
-
-    games: Dict[frozenset[str], tuple[str, str]] = {}
-
-    for _, row in df.iterrows():
-        team = row.get("Team")
-        opp = row.get("Opp")
-        if not isinstance(team, str) or not isinstance(opp, str):
-            continue
-        team = team.strip().upper()
-        opp = opp.strip().upper()
-        if not team or not opp or team == opp:
-            continue
-        key = frozenset((team, opp))
-        games.setdefault(key, (team, opp))
-
-    # sort deterministically by tuple order
-    ordered = sorted(games.values(), key=lambda t: (t[0], t[1]))
-    return ordered
