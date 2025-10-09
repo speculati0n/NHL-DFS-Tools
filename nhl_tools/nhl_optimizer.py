@@ -232,9 +232,7 @@ def solve_single_lineup(players: pd.DataFrame,
 
     # diversification (soft): forbid all players from previous lineup
     if diversify > 0 and diversify_with:
-        for forbid_idx in _normalise_history(df, idx, diversify_with):
-            limit = max(0, len(forbid_idx) - int(diversify))
-            prob += lpSum(x[i] for i in forbid_idx) <= limit
+
 
     # solve
     status = prob.solve(PULP_CBC_CMD(msg=False))
@@ -256,7 +254,7 @@ def build_lineups(df: pd.DataFrame, n: int,
     """
     players = add_quality_columns(df)
     outs = []
-    history: list[list[int]] = []
+
     for k in range(n):
         ok, idxs = solve_single_lineup(
             players, w_up, w_con, w_dud, min_salary, max_vs_goalie,
@@ -284,7 +282,7 @@ def build_lineups(df: pd.DataFrame, n: int,
         lineup["LineupID"] = k+1
         lineup["Slot"] = (["C1","C2","W1","W2","W3","D1","D2","G","UTIL"])[:len(lineup)]
         outs.append(lineup)
-        history.append([int(i) for i in idxs if players.loc[i, "PosCanon"] != "G"])
+
     if outs:
         return pd.concat(outs, ignore_index=True)
     return pd.DataFrame()
