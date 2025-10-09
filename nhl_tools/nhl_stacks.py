@@ -49,6 +49,7 @@ def line_bucket(df: pd.DataFrame) -> pd.DataFrame:
         out["PosCanon"] = None
     is_skater = out["PosCanon"].isin(["C", "W", "D"])
 
+
     def _evrow(r):
         if not is_skater.iloc[r.name]:
             return None
@@ -64,6 +65,7 @@ def line_bucket(df: pd.DataFrame) -> pd.DataFrame:
         return f"{r['Team']}-PP{int(r['PP_Unit'])}"
 
     out["EV_TAG"] = out.apply(_evrow, axis=1)
+
     out["PP_TAG"] = out.apply(_pprow, axis=1)
     return out
 
@@ -100,11 +102,4 @@ def group_line_members(
     return out
 
 
-def game_pairs(df: pd.DataFrame) -> List[str]:
-    """Return sorted game keys present in the player pool."""
 
-    if "GameKey" not in df.columns:
-        return []
-    games = df.dropna(subset=["GameKey"])["GameKey"].unique().tolist()
-    games = [str(g) for g in games]
-    return sorted(games)
