@@ -6,6 +6,10 @@ import pandas as pd
 from pulp import LpProblem, LpVariable, LpBinary, LpMaximize, lpSum, LpStatusOptimal, PULP_CBC_CMD
 
 from .nhl_data import load_labs_for_date, DK_ROSTER, DK_SALARY_CAP
+
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+DEFAULT_LABS_DIR = os.path.join(REPO_ROOT, "dk_data")
 from .nhl_stacks import line_bucket, group_line_members, game_pairs
 
 # ---------- objective helpers (consistency / upside / duds) ----------
@@ -241,7 +245,8 @@ def build_lineups(df: pd.DataFrame, n: int,
 
 def main():
     ap = argparse.ArgumentParser(description="NHL Optimizer (DK) — FantasyLabs input (separate from NFL).")
-    ap.add_argument("--labs-dir", required=True, help="Folder with FantasyLabs NHL CSVs")
+    ap.add_argument("--labs-dir", default=DEFAULT_LABS_DIR,
+                    help="Folder with FantasyLabs NHL CSVs (default: %(default)s)")
     ap.add_argument("--date", required=True, help="YYYY-MM-DD")
     ap.add_argument("--out", required=True, help="Output CSV for lineups")
     ap.add_argument("--num-lineups", type=int, default=20)

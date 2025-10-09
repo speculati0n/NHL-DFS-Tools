@@ -9,7 +9,6 @@ pip install -r requirements.txt
 
 # OPTIMIZER (build 50 lineups for a given slate date)
 python cli/nhl_opt.py ^
-  --labs-dir "C:\Users\Admin\Documents\DFS\nhl labs" ^
   --date 2021-10-13 ^
   --out "out/lineups_2021-10-13.csv" ^
   --num-lineups 50 ^
@@ -20,13 +19,13 @@ python cli/nhl_opt.py ^
 # SIMULATOR (Monte Carlo the resulting CSV)
 python cli/nhl_sim.py ^
   --lineups "out/lineups_2021-10-13.csv" ^
-  --labs-dir "C:\Users\Admin\Documents\DFS\nhl labs" ^
   --date 2021-10-13 ^
   --sims 20000 ^
   --out "out/sim_report_2021-10-13.csv"
 
 ## FantasyLabs inputs
-Place these four files for the slate date in --labs-dir:
+By default the CLIs look for FantasyLabs exports inside the repository's `dk_data` folder.
+Populate that directory (or point `--labs-dir` elsewhere) with these four files for the slate date:
   fantasylabs_player_data_NHL_C_YYYYMMDD.csv
   fantasylabs_player_data_NHL_W_YYYYMMDD.csv
   fantasylabs_player_data_NHL_D_YYYYMMDD.csv
