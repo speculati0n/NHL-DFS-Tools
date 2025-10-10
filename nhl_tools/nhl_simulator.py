@@ -1,15 +1,33 @@
 from __future__ import annotations
 import argparse, os, sys, math
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from scipy.stats import gamma, lognorm
 
 from .nhl_data import load_labs_for_date
+from .dk_export import parse_lineups_any as _parse_any, SLOTS as DK_SLOTS, clean_display_name
 
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 DEFAULT_LABS_DIR = os.path.join(REPO_ROOT, "dk_data")
+SLOT_PRIMARY_POS: Dict[str, Optional[str]] = {
+    "C1": "C",
+    "C2": "C",
+    "W1": "W",
+    "W2": "W",
+    "W3": "W",
+    "D1": "D",
+    "D2": "D",
+    "G": "G",
+    "UTIL": None,
+}
+
+
+def load_lineups_any(path: str) -> pd.DataFrame:
+    """Load optimizer output in either tall or DK-upload wide format."""
+
+    return _parse_any(path)
 
 def _sample_points(mean: float, vol: float, rng: np.random.Generator) -> float:
     """
@@ -34,7 +52,72 @@ def simulate_lineups(lineups_csv: str,
     base = load_labs_for_date(labs_dir, date)
     base = base.set_index(["Name","Team","PosCanon"])
 
-    lu = pd.read_csv(lineups_csv)
+    wide_lineups = load_lineups_any(lineups_csv)
+    hints = wide_lineups.attrs.get("slot_hints") or [{} for _ in range(len(wide_lineups))]
+
+    labs_lookup = base.reset_index()[["Name", "Team", "PosCanon"]].drop_duplicates()
+    labs_lookup["TeamUp"] = labs_lookup["Team"].astype(str).str.upper()
+    labs_lookup["PosUp"] = labs_lookup["PosCanon"].astype(str).str.upper()
+
+    def _resolve_attrs(name: str,
+                       pos_hint: Optional[str],
+                       team_hint: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+        if not name:
+            return team_hint, pos_hint
+        subset = labs_lookup[labs_lookup["Name"] == name]
+        if subset.empty:
+            return team_hint, pos_hint
+        working = subset
+        if pos_hint:
+            pos_up = pos_hint.upper()
+            pos_filtered = working[working["PosUp"] == pos_up]
+            if not pos_filtered.empty:
+                working = pos_filtered
+        if team_hint:
+            team_up = team_hint.upper()
+            team_filtered = working[working["TeamUp"] == team_up]
+            if not team_filtered.empty:
+                working = team_filtered
+        row = working.iloc[0]
+        return row["Team"], row["PosCanon"]
+
+    lineup_rows: List[Dict[str, object]] = []
+    for idx, row in wide_lineups.iterrows():
+        lineup_id = int(idx) + 1
+        hint_map = hints[idx] if idx < len(hints) else {}
+        for slot in DK_SLOTS:
+            raw_value = row.get(slot, "")
+            text = str(raw_value) if raw_value is not None else ""
+            name = clean_display_name(text)
+            if not name:
+                continue
+            team_hint: Optional[str] = None
+            pos_hint: Optional[str] = None
+            if isinstance(hint_map, dict) and slot in hint_map:
+                hint_tuple = hint_map.get(slot, (None, None))
+                team_hint = hint_tuple[0]
+                pos_hint = hint_tuple[1]
+            if team_hint:
+                team_hint = str(team_hint).upper()
+            if pos_hint:
+                pos_hint = str(pos_hint).upper()
+            slot_pos = pos_hint or SLOT_PRIMARY_POS.get(slot)
+            resolved_team, resolved_pos = _resolve_attrs(name, slot_pos, team_hint)
+            team_val = (resolved_team or team_hint or "")
+            pos_val = (resolved_pos or slot_pos or "")
+            lineup_rows.append({
+                "LineupID": lineup_id,
+                "Slot": slot,
+                "Name": name,
+                "Team": team_val,
+                "PosCanon": pos_val,
+            })
+
+    if not lineup_rows:
+        raise ValueError(f"No lineup data available in {lineups_csv}")
+
+    lu = pd.DataFrame(lineup_rows)
+    lu["LineupID"] = lu["LineupID"].astype(int)
     lu["key"] = list(zip(lu["Name"], lu["Team"], lu["PosCanon"]))
     # attach means
     def _m(k):
