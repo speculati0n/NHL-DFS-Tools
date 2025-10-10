@@ -6,12 +6,14 @@ from typing import Any, Dict
 import yaml
 
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+
+
 def _ensure_repo_on_path() -> None:
     """Add the repository root to sys.path for direct CLI execution."""
 
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
+    if REPO_ROOT not in sys.path:
+        sys.path.insert(0, REPO_ROOT)
 
 
 def _default_config_path() -> str:
@@ -66,6 +68,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser.add_argument("--diversify", type=int, default=1,
                         help=">0 to force at least one change from prior lineup (legacy)")
+
+    # Optional DraftKings export plumbing
+    parser.add_argument("--dk-upload", action="store_true",
+                        help="Also emit DraftKings upload CSV (wide, Name (id))")
+    parser.add_argument("--upload-out", type=str, default=None,
+                        help="Output DK upload CSV path (default: <out> _DKUPLOAD.csv)")
+    parser.add_argument("--player-ids", type=str, default=None,
+                        help="NHL dk_data/player_ids.csv (default: <labs-dir>/player_ids.csv)")
+    parser.add_argument("--strict", action="store_true",
+                        help="Fail if any player cannot be mapped during export")
 
     # Config management & overrides
     parser.add_argument("--config", default=None, help="Path to optimizer YAML config")
@@ -132,7 +144,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     cfg = load_config(args)
 
-    labs_dir = args.labs_dir or os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)), "dk_data")
+    labs_dir = args.labs_dir or os.path.join(REPO_ROOT, "dk_data")
     max_vs_goalie_cfg = cfg.get("correlation", {}).get("max_skaters_vs_goalie")
     if args.max_vs_goalie is not None:
         max_vs_goalie = args.max_vs_goalie
@@ -166,6 +178,22 @@ def main(argv: list[str] | None = None) -> None:
         floor_mult=args.floor_mult,
         diversify=args.diversify,
     )
+
+    if args.dk_upload:
+        from nhl_tools import dk_export
+
+        export_out = args.upload_out or os.path.splitext(args.out)[0] + "_DKUPLOAD.csv"
+        player_ids_default_base = args.labs_dir or os.path.join(REPO_ROOT, "dk_data")
+        player_ids_path = args.player_ids or os.path.join(player_ids_default_base, "player_ids.csv")
+
+        print(f"[NHL] Exporting DK upload: {export_out}")
+        dk_export.export(
+            lineups_path=args.out,
+            ids_path=player_ids_path,
+            out_path=export_out,
+            strict=args.strict,
+            league="NHL",
+        )
 
 
 if __name__ == "__main__":
