@@ -1,11 +1,12 @@
 from __future__ import annotations
-import argparse, os, sys, math
+import argparse, os, sys, math, re
 from typing import Dict, List
 import numpy as np
 import pandas as pd
 from scipy.stats import gamma, lognorm
 
 from .nhl_data import load_labs_for_date
+from nhl_tools.dk_export import DK_NHL_SLOTS, parse_lineups_any as _parse_lineups_any
 
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -32,17 +33,65 @@ def simulate_lineups(lineups_csv: str,
     For each lineup, sample player outcomes and sum DK points; report quantiles & dud rates.
     """
     base = load_labs_for_date(labs_dir, date)
-    base = base.set_index(["Name","Team","PosCanon"])
+    base_lookup = base.copy()
+    base_lookup["NameNorm"] = base_lookup["Name"].astype(str).str.lower()
+    base_lookup["PosCanonNorm"] = base_lookup["PosCanon"].astype(str).str.upper()
 
-    lu = pd.read_csv(lineups_csv)
-    lu["key"] = list(zip(lu["Name"], lu["Team"], lu["PosCanon"]))
-    # attach means
-    def _m(k):
-        return base.loc[k,"Proj"] if k in base.index else np.nan
-    lu["Mean"] = lu["key"].map(_m)
+    wide = _parse_lineups_any(lineups_csv)
+    slot_cols = [c for c in DK_NHL_SLOTS if c in wide.columns]
+    lineup_names = wide[["LineupID"] + slot_cols].copy()
+
+    slot_pos = {
+        "C1": "C", "C2": "C",
+        "W1": "W", "W2": "W", "W3": "W",
+        "D1": "D", "D2": "D",
+        "G": "G",
+        "UTIL": None,
+    }
+
+    records: List[Dict[str, object]] = []
+    for _, row in lineup_names.iterrows():
+        lid = int(row["LineupID"])
+        for slot in slot_cols:
+            raw_name = row[slot]
+            if pd.isna(raw_name):
+                continue
+            name_str = str(raw_name).strip()
+            if not name_str:
+                continue
+            clean_name = re.sub(r"\s*\([^)]*\)\s*$", "", name_str).strip()
+            pos_hint = slot_pos.get(slot)
+            candidates = base_lookup[base_lookup["NameNorm"] == clean_name.lower()]
+            if pos_hint:
+                candidates = candidates[candidates["PosCanonNorm"] == pos_hint]
+            if candidates.empty:
+                team = None
+                pos = pos_hint
+                proj = np.nan
+            else:
+                picked = candidates.iloc[0]
+                team = picked["Team"]
+                pos = picked["PosCanon"]
+                proj = float(picked["Proj"])
+            records.append({
+                "LineupID": lid,
+                "Slot": slot,
+                "Name": clean_name,
+                "Team": team,
+                "PosCanon": pos,
+                "Proj": proj,
+            })
+
+    lu = pd.DataFrame(records)
+    if lu.empty:
+        raise ValueError("No players parsed from lineups CSV.")
+
+    lu["Mean"] = lu["Proj"]
     if lu["Mean"].isna().any():
         print("Warning: some players not found in Labs for sim; dropping those rows.")
         lu = lu.dropna(subset=["Mean"])
+
+    lu["PosCanon"] = lu["PosCanon"].astype(str)
 
     # volatility proxy from upside/consistency
     lu["Ceil"] = lu["Mean"] * ceil_mult

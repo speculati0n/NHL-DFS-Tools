@@ -307,6 +307,7 @@ def main():
         if c not in lineups.columns: lineups[c]=None
     lineups[cols].to_csv(args.out, index=False)
     print(f"Wrote {len(lineups['LineupID'].unique())} lineups -> {args.out}")
+    return args.out
 
 if __name__ == "__main__":
     main()
