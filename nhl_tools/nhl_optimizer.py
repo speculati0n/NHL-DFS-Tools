@@ -17,6 +17,19 @@ DEFAULT_LABS_DIR = os.path.join(REPO_ROOT, "dk_data")
 TOTAL_ROSTER_SLOTS = sum(DK_ROSTER.values())
 
 
+def _print_constraint_summary(*, n, min_salary, max_vs_goalie, team_cap, stack_requirements,
+                              bringback_min, min_uniques, has_own, ownership_enabled,
+                              total_own_max, chalk_thresh, max_chalk) -> None:
+    print(
+        "[NHL][Constraints] "
+        f"n={n}, min_salary={min_salary}, max_vs_goalie={max_vs_goalie}, team_cap={team_cap}; "
+        f"stacks={stack_requirements}, bringback_min={bringback_min}, min_uniques={min_uniques}; "
+        "ownership("
+        f"has={has_own}, enabled={ownership_enabled}, total_max={total_own_max}, "
+        f"chalk_thresh={chalk_thresh}, max_chalk={max_chalk})"
+    )
+
+
 def _cfg_get(cfg: Dict[str, Any], path: Sequence[str], default: Any) -> Any:
     cur: Any = cfg
     for key in path:
@@ -429,6 +442,39 @@ def build_lineups(
     return pd.DataFrame()
 
 
+def _try_build(
+    players,
+    *,
+    cfg,
+    num_lineups,
+    min_salary,
+    max_vs_goalie,
+    stack_requirements,
+    bringback,
+    w_up,
+    w_con,
+    w_dud,
+    ownership_ctx,
+    min_uniques,
+    rng,
+):
+    return build_lineups(
+        players,
+        cfg=cfg,
+        n=num_lineups,
+        rng=rng,
+        min_salary_floor=min_salary,
+        max_vs_goalie=max_vs_goalie,
+        stack_requirements=stack_requirements,
+        bringback_min=bringback,
+        w_up=w_up,
+        w_con=w_con,
+        w_dud=w_dud,
+        ownership_ctx=ownership_ctx,
+        min_uniques=min_uniques,
+    )
+
+
 def main(
     *,
     cfg: Dict[str, Any],
@@ -483,21 +529,113 @@ def main(
         "same5": same5,
     }
 
-    lineup_df = build_lineups(
-        players,
-        cfg=cfg,
+    # Incompatibility guard: bringback requires allowing at least one skater vs G
+    if bringback > 0 and max_vs_goalie == 0:
+        print("[NHL][Adjust] bringback > 0 but max_vs_goalie == 0 → setting max_vs_goalie = 1")
+        max_vs_goalie = 1
+
+    _print_constraint_summary(
         n=num_lineups,
-        rng=rng,
-        min_salary_floor=min_salary,
+        min_salary=min_salary,
         max_vs_goalie=max_vs_goalie,
+        team_cap=5,
         stack_requirements=stack_requirements,
         bringback_min=bringback,
+        min_uniques=min_uniques,
+        has_own=has_own,
+        ownership_enabled=ownership_enabled,
+        total_own_max=total_own_max,
+        chalk_thresh=chalk_thresh,
+        max_chalk=max_chalk,
+    )
+
+    lineup_df = _try_build(
+        players,
+        cfg=cfg,
+        num_lineups=num_lineups,
+        min_salary=min_salary,
+        max_vs_goalie=max_vs_goalie,
+        stack_requirements=stack_requirements,
+        bringback=bringback,
         w_up=w_up,
         w_con=w_con,
         w_dud=w_dud,
         ownership_ctx=(has_own, ownership_enabled, total_own_max, chalk_thresh, max_chalk),
         min_uniques=min_uniques,
+        rng=rng,
     )
+
+    new_max_vs_goalie = max_vs_goalie
+    min_salary_floor = min_salary
+    min_uniques2 = min_uniques
+
+    if lineup_df.empty:
+        print("[NHL][AutoRelax] No lineups on first attempt — applying fallback ladder.")
+        # Step A: allow at least one skater vs goalie
+        new_max_vs_goalie = max(1, max_vs_goalie)
+        if new_max_vs_goalie != max_vs_goalie:
+            print(f"[NHL][AutoRelax] max_vs_goalie: {max_vs_goalie} → {new_max_vs_goalie}")
+        # Step B: relax min_salary in 500 steps down to a sensible floor
+        min_salary_floor = max(48000, min_salary - 500)
+        if min_salary_floor != min_salary:
+            print(f"[NHL][AutoRelax] min_salary: {min_salary} → {min_salary_floor}")
+        # Try again
+        lineup_df = _try_build(
+            players,
+            cfg=cfg,
+            num_lineups=num_lineups,
+            min_salary=min_salary_floor,
+            max_vs_goalie=new_max_vs_goalie,
+            stack_requirements=stack_requirements,
+            bringback=bringback,
+            w_up=w_up,
+            w_con=w_con,
+            w_dud=w_dud,
+            ownership_ctx=(has_own, ownership_enabled, total_own_max, chalk_thresh, max_chalk),
+            min_uniques=min_uniques,
+            rng=rng,
+        )
+
+    if lineup_df.empty:
+        # Step C: uniqueness → 1
+        if min_uniques > 1:
+            print(f"[NHL][AutoRelax] min_uniques: {min_uniques} → 1")
+        min_uniques2 = 1
+        lineup_df = _try_build(
+            players,
+            cfg=cfg,
+            num_lineups=num_lineups,
+            min_salary=min_salary_floor,
+            max_vs_goalie=new_max_vs_goalie,
+            stack_requirements=stack_requirements,
+            bringback=bringback,
+            w_up=w_up,
+            w_con=w_con,
+            w_dud=w_dud,
+            ownership_ctx=(has_own, ownership_enabled, total_own_max, chalk_thresh, max_chalk),
+            min_uniques=min_uniques2,
+            rng=rng,
+        )
+
+    if lineup_df.empty:
+        # Step D: kill stack mins + bringback
+        print("[NHL][AutoRelax] Disabling stacks & bringback requirements.")
+        zero_stacks = {k: 0 for k in ("evline2", "evline3", "pp1_2", "pp1_3", "pp2_2", "same2", "same3", "same4", "same5")}
+        lineup_df = _try_build(
+            players,
+            cfg=cfg,
+            num_lineups=num_lineups,
+            min_salary=min_salary_floor,
+            max_vs_goalie=new_max_vs_goalie,
+            stack_requirements=zero_stacks,
+            bringback=0,
+            w_up=w_up,
+            w_con=w_con,
+            w_dud=w_dud,
+            ownership_ctx=(has_own, ownership_enabled, total_own_max, chalk_thresh, max_chalk),
+            min_uniques=1,
+            rng=rng,
+        )
 
     if lineup_df.empty:
         print("No lineups produced.")
