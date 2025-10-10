@@ -404,34 +404,56 @@ def build_lineups(
         w_pp1 = _jitter_weight(w_pp1_base, weight_jitter_pct, rng)
         noise = rng.normal(0.0, objective_noise_std, size=len(players)) if objective_noise_std > 0 else np.zeros(len(players))
 
-        ok, idxs, extras = solve_single_lineup(
-            players,
-            min_salary=min_salary,
-            max_vs_goalie=max_vs_goalie,
-            stack_requirements=stack_requirements,
-            bringback_min=bringback_min,
-            bringback_max=bringback_max,
-            min_uniques=min_uniques,
-            prior_lineups=prior_lineups,
-            w_up=w_up,
-            w_con=w_con,
-            w_dud=w_dud,
-            w_eff=w_eff,
-            w_ev3=w_ev,
-            w_pp1=w_pp1,
-            noise=noise,
-            has_own=has_own,
-            ownership_enabled=ownership_enabled,
-            total_own_max=total_own_max,
-            chalk_thresh=chalk_thresh,
-            max_chalk=max_chalk,
-        )
+        # Try multiple leftover targets before giving up on lineup k
+        buckets_cfg = _cfg_get(cfg, ["random", "leftover_buckets"], {"mix": [0, 100, 200]})
+        mode = str(_cfg_get(cfg, ["random", "leftover_mode"], "mix"))
+        bucket_list = list(buckets_cfg.get(mode, [0, 100, 200]))
+        # Heuristic: try non-zero first, then zero last (if present)
+        bucket_list_sorted = sorted(set(bucket_list), key=lambda x: (x == 0, x))
+
+        ok = False
+        idxs: List[int] = []
+        extras: Dict[str, Any] = {}
+        tried: List[int] = []
+
+        for lb in bucket_list_sorted:
+            tried.append(lb)
+            _min_salary = DK_SALARY_CAP - int(lb) if enforce_min else min_salary_floor
+            _min_salary = max(_min_salary, min_salary_floor)
+
+            ok, idxs, extras = solve_single_lineup(
+                players,
+                min_salary=int(_min_salary),
+                max_vs_goalie=max_vs_goalie,
+                stack_requirements=stack_requirements,
+                bringback_min=bringback_min,
+                bringback_max=bringback_max,
+                min_uniques=min_uniques,
+                prior_lineups=prior_lineups,
+                w_up=w_up,
+                w_con=w_con,
+                w_dud=w_dud,
+                w_eff=w_eff,
+                w_ev3=w_ev,
+                w_pp1=w_pp1,
+                noise=noise,
+                has_own=has_own,
+                ownership_enabled=ownership_enabled,
+                total_own_max=total_own_max,
+                chalk_thresh=chalk_thresh,
+                max_chalk=max_chalk,
+            )
+            if ok:
+                break
+
         if not ok:
-            print(f"Stopping after {k} lineups (solver infeasible — uniqueness or constraints).")
-            break
+            print(
+                f"Lineup {k}: infeasible for leftover buckets {tried} — continuing to fallback/next lineup."
+            )
+            continue
 
         summary = _summarise_lineup(players, idxs, has_own, chalk_thresh, extras, prior_lineups)
-        print(f"Lineup {k + 1:02d}: {summary}")
+        print(f"[NHL] Built lineup {k + 1}: {summary}")
 
         lineup = _finalise_lineup(players, idxs, k + 1)
         lineups.append(lineup)
@@ -628,6 +650,81 @@ def main(
             min_salary=min_salary_floor,
             max_vs_goalie=new_max_vs_goalie,
             stack_requirements=zero_stacks,
+            bringback=0,
+            w_up=w_up,
+            w_con=w_con,
+            w_dud=w_dud,
+            ownership_ctx=(has_own, ownership_enabled, total_own_max, chalk_thresh, max_chalk),
+            min_uniques=1,
+            rng=rng,
+        )
+
+    if lineup_df.empty:
+        print("[NHL][AutoRelax] Final attempt: disable enforce_min and sweep leftover targets.")
+
+        def _final_attempt(
+            players,
+            cfg,
+            num_lineups,
+            min_salary_floor,
+            max_vs_goalie,
+            stack_requirements,
+            bringback,
+            w_up,
+            w_con,
+            w_dud,
+            ownership_ctx,
+            min_uniques,
+            rng,
+        ):
+            has_own, ownership_enabled, total_own_max, chalk_thresh, max_chalk = ownership_ctx
+            buckets_cfg = _cfg_get(cfg, ["random", "leftover_buckets"], {"mix": [0, 100, 200]})
+            mode = str(_cfg_get(cfg, ["random", "leftover_mode"], "mix"))
+            bucket_list = list(buckets_cfg.get(mode, [0, 100, 200]))
+            ok = False
+            prior_lineups: List[List[int]] = []
+            lineups: List[pd.DataFrame] = []
+            for k in range(num_lineups):
+                ok = False
+                for _lb in bucket_list:
+                    ok2, idxs, extras = solve_single_lineup(
+                        players,
+                        min_salary=int(min_salary_floor),
+                        max_vs_goalie=max_vs_goalie,
+                        stack_requirements=stack_requirements,
+                        bringback_min=bringback,
+                        bringback_max=int(_cfg_get(cfg, ["correlation", "bringbacks_max"], 999)),
+                        min_uniques=min_uniques,
+                        prior_lineups=prior_lineups,
+                        w_up=w_up,
+                        w_con=w_con,
+                        w_dud=w_dud,
+                        w_eff=float(_cfg_get(cfg, ["ownership", "w_eff"], 0.0)) if ownership_enabled and has_own else 0.0,
+                        w_ev3=float(_cfg_get(cfg, ["correlation", "w_ev_stack_3p"], 0.0)),
+                        w_pp1=float(_cfg_get(cfg, ["correlation", "w_pp1_stack_3p"], 0.0)),
+                        noise=rng.normal(0.0, float(_cfg_get(cfg, ["random", "objective_noise_std"], 0.0)), size=len(players)),
+                        has_own=has_own,
+                        ownership_enabled=ownership_enabled,
+                        total_own_max=float(_cfg_get(cfg, ["ownership", "total_own_max"], 130.0)),
+                        chalk_thresh=float(_cfg_get(cfg, ["ownership", "chalk_thresh"], 20.0)),
+                        max_chalk=int(_cfg_get(cfg, ["ownership", "max_chalk"], 2)),
+                    )
+                    if ok2:
+                        lineups.append(_finalise_lineup(players, idxs, len(prior_lineups) + 1))
+                        prior_lineups.append(list(idxs))
+                        ok = True
+                        break
+                if not ok:
+                    break
+            return pd.concat(lineups, ignore_index=True) if lineups else pd.DataFrame()
+
+        lineup_df = _final_attempt(
+            players,
+            cfg,
+            num_lineups,
+            min_salary_floor=min_salary_floor,
+            max_vs_goalie=new_max_vs_goalie,
+            stack_requirements=zero_stacks if "zero_stacks" in locals() else stack_requirements,
             bringback=0,
             w_up=w_up,
             w_con=w_con,
