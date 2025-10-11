@@ -16,14 +16,19 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from nhl_tools.id_mapping import load_player_ids_any, find_pid  # NEW
+# If you’re using the DK export-style player_ids.csv support I provided earlier:
+try:
+    from nhl_tools.id_mapping import load_player_ids_any, find_pid
+except Exception:
+    load_player_ids_any = None
+    find_pid = None
 
 # ───────────────────────────────────────────────────────────────────────────────
-# CONFIG / CONSTANTS (DK NHL Classic)
+# CONFIG / CONSTANTS
 # ───────────────────────────────────────────────────────────────────────────────
 DK_SALARY_CAP = 50000
 DK_ROSTER = ["C1", "C2", "W1", "W2", "W3", "D1", "D2", "G", "UTIL"]
-NEED = {"C":2,"W":3,"D":2,"G":1}  # skater UTIL added after
+NEED = {"C": 2, "W": 3, "D": 2, "G": 1}  # UTIL = any skater
 
 ELIGIBILITY = {
     "C": ["C1", "C2", "UTIL"],
@@ -41,17 +46,6 @@ LABS_PATTERNS = {
     "G": "fantasylabs_player_data_NHL_G_{date}.csv",
 }
 
-COLMAP = {
-    "Player": "name",
-    "Team": "team",
-    "Opp": "opp",
-    "Salary": "salary",
-    "Proj": "proj_points",
-    "Own": "projected_own",
-    "Full": "full_stack_flag",
-    "PP": "powerplay_flag",
-}
-
 LOG = logging.getLogger("nhl_opt")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -59,8 +53,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 # HELPERS
 # ───────────────────────────────────────────────────────────────────────────────
 def _safe_str(x) -> str:
-    if x is None: return ""
-    if isinstance(x, float) and np.isnan(x): return ""
+    if x is None:
+        return ""
+    if isinstance(x, float) and np.isnan(x):
+        return ""
     return str(x)
 
 
@@ -87,46 +83,130 @@ def _resolve_four_paths(labs_dir: str, date: str) -> Dict[str, str]:
     return out
 
 
+# ───────────────────────────────────────────────────────────────────────────────
+# ROBUST HEADER NORMALIZATION
+# ───────────────────────────────────────────────────────────────────────────────
+def _normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Map common FantasyLabs/DK headers to canonical names.
+    Accept both Player & Name; Team & TeamAbbrev; various Salary/Proj spellings.
+    """
+    ren = {}
+    for c in df.columns:
+        cl = c.strip()
+        low = cl.lower()
+
+        # name / player
+        if low in ("player", "name"):
+            ren[c] = "name"
+
+        # team
+        elif low in ("team", "teamabbrev", "team_abbrev", "teamabbr"):
+            ren[c] = "team"
+
+        # opponent
+        elif low in ("opp", "opponent"):
+            ren[c] = "opp"
+
+        # salary
+        elif low.replace(" ", "") in ("salary", "dksalary", "dk_salary"):
+            ren[c] = "salary"
+
+        # projections (accept a wide set)
+        elif low in (
+            "proj",
+            "projection",
+            "projected",
+            "proj_points",
+            "fpts",
+            "points",
+            "median projection",
+            "median_projection",
+            "medianprojection",
+        ):
+            ren[c] = "proj_points"
+
+        # ownership
+        elif low in ("own", "ownership", "proj_own", "projected_own"):
+            ren[c] = "projected_own"
+
+        # position (we *don’t* rely on this for slotting, but keep if present)
+        elif low in ("pos", "position", "roster position", "roster_position"):
+            ren[c] = "pos_raw"
+
+    return df.rename(columns=ren)
+
+
+def _clean_frame(df: pd.DataFrame, pos: str) -> pd.DataFrame:
+    """Coerce to required columns and sanitize values."""
+    x = df.copy()
+
+    # Ensure required exist
+    for need in ["name", "team", "salary"]:
+        if need not in x.columns:
+            x[need] = ""
+
+    # Coerce + clean
+    x["name"] = x["name"].apply(_safe_str)
+    x["team"] = x["team"].apply(_safe_str)
+    x["salary"] = (
+        x["salary"].apply(_safe_str)
+        .str.replace(",", "", regex=False)
+        .str.replace("$", "", regex=False)
+        .str.extract(r"(\d+)", expand=False)
+        .fillna("0")
+        .astype(int)
+    )
+
+    if "proj_points" not in x.columns:
+        x["proj_points"] = 0.0
+    x["proj_points"] = pd.to_numeric(x["proj_points"], errors="coerce").fillna(0.0)
+
+    # Force position from the file type we’re reading
+    x["pos"] = pos
+
+    # Final formatting
+    x["team"] = x["team"].str.upper().str.strip()
+    x = x[["name", "team", "salary", "proj_points", "pos"]]
+
+    # Drop blanks/zeros
+    x = x[(x["name"].str.strip() != "") & (x["salary"] > 0)].copy()
+    return x
+
+
 def _read_labs_one(path: str, pos: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    rename = {k:v for k,v in COLMAP.items() if k in df.columns}
-    df = df.rename(columns=rename)
-    for need in ["name","team","salary"]:
-        if need not in df.columns:
-            raise ValueError(f"{path}: missing '{need}' after rename")
-    # sanitize
-    df["name"] = df["name"].apply(_safe_str)
-    df["team"] = df["team"].apply(_safe_str)
-    if "opp" in df.columns: df["opp"] = df["opp"].apply(_safe_str)
-    # salary
-    df["salary"] = (df["salary"].apply(_safe_str).str.replace(",","",regex=False)
-                    .str.extract(r"(\d+)", expand=False).fillna("0").astype(int))
-    if "proj_points" not in df.columns: df["proj_points"] = 0.0
-    df["proj_points"] = pd.to_numeric(df["proj_points"], errors="coerce").fillna(0.0)
-    if "projected_own" not in df.columns: df["projected_own"] = 0.0
-    df["projected_own"] = pd.to_numeric(df["projected_own"], errors="coerce").fillna(0.0)
-    df["pos"] = pos
-    df["name_key"] = df["name"].map(_norm_name)
-    df["team"] = df["team"].str.upper().str.strip()
-    if "opp" in df.columns: df["opp"] = df["opp"].str.upper().str.strip()
+    """Read one FantasyLabs per-position CSV with robust header mapping."""
+    df = pd.read_csv(path, engine="python")
+    LOG.info("Reading %s (%s) with columns: %s", os.path.basename(path), pos, list(df.columns))
+    df = _normalize_headers(df)
+    df = _clean_frame(df, pos)
     return df
+
 
 def load_labs_merged(labs_dir: str, date: str) -> pd.DataFrame:
     paths = _resolve_four_paths(labs_dir, date)
-    frames = [_read_labs_one(pth, pos) for pos,pth in paths.items()]
-    full = pd.concat(frames, ignore_index=True)
-    full = full[full["name"].str.len() > 0].copy()
-    # drop dup per name_key+pos, keep best proj
-    full = full.sort_values(["name_key","pos","proj_points"], ascending=[True,True,False])
-    full = full.drop_duplicates(subset=["name_key","pos"], keep="first").reset_index(drop=True)
+    frames = []
+    for pos, pth in paths.items():
+        frames.append(_read_labs_one(pth, pos))
+    full = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
+        columns=["name", "team", "salary", "proj_points", "pos"]
+    )
+    full = full[full["name"].astype(str).str.len() > 0].copy()
+    # Dedup by normalized name+pos (keep highest projection)
+    full["name_key"] = full["name"].map(_norm_name)
+    full = full.sort_values(["name_key", "pos", "proj_points"], ascending=[True, True, False])
+    full = full.drop_duplicates(subset=["name_key", "pos"], keep="first").reset_index(drop=True)
     return full
 
 
-def apply_randomness(df: pd.DataFrame, randomness_by_pos: Dict[str,float] | None) -> pd.DataFrame:
+# ───────────────────────────────────────────────────────────────────────────────
+# RANDOMNESS / FEASIBILITY
+# ───────────────────────────────────────────────────────────────────────────────
+def apply_randomness(df: pd.DataFrame, randomness_by_pos: Dict[str, float] | None) -> pd.DataFrame:
     rbp = randomness_by_pos or DEFAULT_RANDOMNESS_BY_POS
     out = df.copy()
     base = pd.to_numeric(out["proj_points"], errors="coerce").fillna(0.0).astype(float).values
-    pos  = out["pos"].astype(str).values
+    pos = out["pos"].astype(str).values
     jittered = []
     for i in range(len(out)):
         pct = float(rbp.get(pos[i], 0.0))
@@ -136,53 +216,60 @@ def apply_randomness(df: pd.DataFrame, randomness_by_pos: Dict[str,float] | None
     return out
 
 
-# ───────────────────────────────────────────────────────────────────────────────
-# FEASIBILITY DIAGNOSTICS
-# ───────────────────────────────────────────────────────────────────────────────
-def _approx_feasible_salary_range(pool: pd.DataFrame) -> tuple[int,int,bool,Dict[str,int]]:
+def _approx_feasible_salary_range(pool: pd.DataFrame) -> tuple[int, int, bool, Dict[str, int]]:
     ok = True
     feas_min = 0
     feas_max = 0
     counts = {}
-    for p,n in NEED.items():
-        pp = pool[pool["pos"]==p].sort_values("salary")
+    for p, n in NEED.items():
+        pp = pool[pool["pos"] == p].sort_values("salary")
         counts[p] = len(pp)
         if len(pp) < n:
             ok = False
-        feas_min += (pp["salary"].iloc[:min(len(pp),n)].sum() if len(pp)>=n else 10**9)
-        feas_max += (pp["salary"].sort_values(ascending=False).iloc[:min(len(pp),n)].sum() if len(pp)>=n else 0)
-    # UTIL (skater)
-    sk = pool[pool["pos"].isin(["C","W","D"])].sort_values("salary")
-    if len(sk)==0: ok=False
-    feas_min += (sk["salary"].iloc[0] if len(sk)>0 else 10**9)
-    feas_max += (sk["salary"].iloc[-1] if len(sk)>0 else 0)
+        feas_min += (pp["salary"].iloc[: min(len(pp), n)].sum() if len(pp) >= n else 10**9)
+        feas_max += (
+            pp["salary"].sort_values(ascending=False).iloc[: min(len(pp), n)].sum() if len(pp) >= n else 0
+        )
+    sk = pool[pool["pos"].isin(["C", "W", "D"])].sort_values("salary")
+    if len(sk) == 0:
+        ok = False
+        util_min = 10**9
+        util_max = 0
+    else:
+        util_min = int(sk["salary"].iloc[0])
+        util_max = int(sk["salary"].iloc[-1])
+        feas_min += util_min
+        feas_max += util_max
     return feas_min, feas_max, ok, counts
 
 
 # ───────────────────────────────────────────────────────────────────────────────
-# SIMPLE GREEDY + SALARY STEERING
+# LINEUP BUILDER (greedy + salary steer)
 # ───────────────────────────────────────────────────────────────────────────────
 def _choose(pool, pos, chosen, remain_cap):
-    cand = pool[(pool["pos"]==pos) & (~pool.index.isin(chosen)) & (pool["salary"]<=remain_cap)]
-    if cand.empty: return None
-    return int((cand["proj_points_rand"] + np.random.rand(len(cand))*1e-6).idxmax())
+    cand = pool[(pool["pos"] == pos) & (~pool.index.isin(chosen)) & (pool["salary"] <= remain_cap)]
+    if cand.empty:
+        return None
+    return int((cand["proj_points_rand"] + np.random.rand(len(cand)) * 1e-6).idxmax())
 
 
-def _try_salary_steer(pool, roster_idx: Dict[str,int], target_min: int, current_salary: int, cap: int):
+def _try_salary_steer(pool, roster_idx: Dict[str, int], target_min: int, current_salary: int, cap: int):
     if current_salary >= target_min:
         return roster_idx, current_salary
-    order = ["UTIL","W3","W2","W1","D2","D1","C2","C1"]
+    order = ["UTIL", "W3", "W2", "W1", "D2", "D1", "C2", "C1"]
     for slot in order:
         i = roster_idx.get(slot)
-        if i is None: continue
+        if i is None:
+            continue
         row = pool.loc[i]
         pos = row["pos"]
         remain = cap - (current_salary - int(row["salary"]))
-        cand = pool[(pool["pos"]==pos) & (pool.index!=i) & (pool["salary"]<=remain)]
+        cand = pool[(pool["pos"] == pos) & (pool.index != i) & (pool["salary"] <= remain)]
         cand = cand[cand["salary"] > int(row["salary"])]
-        if cand.empty: continue
-        j = int((cand["proj_points_rand"] + np.random.rand(len(cand))*1e-6).idxmax())
-        delta = int(pool.loc[j,"salary"]) - int(row["salary"])
+        if cand.empty:
+            continue
+        j = int((cand["proj_points_rand"] + np.random.rand(len(cand)) * 1e-6).idxmax())
+        delta = int(pool.loc[j, "salary"]) - int(row["salary"])
         roster_idx[slot] = j
         current_salary += delta
         if current_salary >= target_min:
@@ -190,43 +277,66 @@ def _try_salary_steer(pool, roster_idx: Dict[str,int], target_min: int, current_
     return roster_idx, current_salary
 
 
-def build_lineups(pool: pd.DataFrame, num: int, min_salary: int, max_salary: int, attempts_multiplier: int = 600) -> List[Dict[str,int]]:
-    lineups: List[Dict[str,int]] = []
+def build_lineups(pool: pd.DataFrame, num: int, min_salary: int, max_salary: int, attempts_multiplier: int = 600) -> List[Dict[str, int]]:
+    lineups: List[Dict[str, int]] = []
     attempts = 0
     max_attempts = max(1000, num * attempts_multiplier)
 
     while len(lineups) < num and attempts < max_attempts:
         attempts += 1
         chosen_idx: List[int] = []
-        r: Dict[str,int] = {}
+        r: Dict[str, int] = {}
         sal = 0
 
         gi = _choose(pool, "G", chosen_idx, max_salary - sal)
-        if gi is None: continue
-        r["G"] = gi; chosen_idx.append(gi); sal += int(pool.loc[gi,"salary"])
+        if gi is None:
+            continue
+        r["G"] = gi
+        chosen_idx.append(gi)
+        sal += int(pool.loc[gi, "salary"])
 
-        for s in ["C1","C2"]:
+        for s in ["C1", "C2"]:
             i = _choose(pool, "C", chosen_idx, max_salary - sal)
-            if i is None: r = {}; break
-            r[s] = i; chosen_idx.append(i); sal += int(pool.loc[i,"salary"])
-        if not r: continue
+            if i is None:
+                r = {}
+                break
+            r[s] = i
+            chosen_idx.append(i)
+            sal += int(pool.loc[i, "salary"])
+        if not r:
+            continue
 
-        for s in ["D1","D2"]:
+        for s in ["D1", "D2"]:
             i = _choose(pool, "D", chosen_idx, max_salary - sal)
-            if i is None: r = {}; break
-            r[s] = i; chosen_idx.append(i); sal += int(pool.loc[i,"salary"])
-        if not r: continue
+            if i is None:
+                r = {}
+                break
+            r[s] = i
+            chosen_idx.append(i)
+            sal += int(pool.loc[i, "salary"])
+        if not r:
+            continue
 
-        for s in ["W1","W2","W3"]:
+        for s in ["W1", "W2", "W3"]:
             i = _choose(pool, "W", chosen_idx, max_salary - sal)
-            if i is None: r = {}; break
-            r[s] = i; chosen_idx.append(i); sal += int(pool.loc[i,"salary"])
-        if not r: continue
+            if i is None:
+                r = {}
+                break
+            r[s] = i
+            chosen_idx.append(i)
+            sal += int(pool.loc[i, "salary"])
+        if not r:
+            continue
 
-        util_pool = pool[(pool["pos"].isin(["C","W","D"])) & (~pool.index.isin(chosen_idx)) & (pool["salary"]<= (max_salary - sal))]
-        if util_pool.empty: continue
-        util_i = int((util_pool["proj_points_rand"] + np.random.rand(len(util_pool))*1e-6).idxmax())
-        r["UTIL"] = util_i; chosen_idx.append(util_i); sal += int(pool.loc[util_i,"salary"])
+        util_pool = pool[
+            (pool["pos"].isin(["C", "W", "D"])) & (~pool.index.isin(chosen_idx)) & (pool["salary"] <= (max_salary - sal))
+        ]
+        if util_pool.empty:
+            continue
+        util_i = int((util_pool["proj_points_rand"] + np.random.rand(len(util_pool)) * 1e-6).idxmax())
+        r["UTIL"] = util_i
+        chosen_idx.append(util_i)
+        sal += int(pool.loc[util_i, "salary"])
 
         if sal < min_salary:
             r, sal = _try_salary_steer(pool, r, min_salary, sal, max_salary)
@@ -243,29 +353,34 @@ def build_lineups(pool: pd.DataFrame, num: int, min_salary: int, max_salary: int
 
 
 # ───────────────────────────────────────────────────────────────────────────────
-# EXPORT / CLI (uses DK export-style player_ids.csv OR simple mapping)
+# EXPORT / CLI
 # ───────────────────────────────────────────────────────────────────────────────
-def decorate(name: str, team: str, pos: str, pid_map: Dict[str,str]) -> str:
-    pid = find_pid(name, team, pos, pid_map)  # NEW: robust lookup with fallbacks
+def _decorate(name: str, team: str, pos: str, pid_map: Dict[str, str]) -> str:
+    if find_pid and pid_map:
+        pid = find_pid(name, team, pos, pid_map)
+    else:
+        pid = ""
     return f"{_safe_str(name)} ({pid})"
 
 
-def export_lineups(pool: pd.DataFrame, lineups: List[Dict[str,int]], pid_map: Dict[str,str], out_path: str, raw_path: Optional[str]=None) -> None:
+def export_lineups(pool: pd.DataFrame, lineups: List[Dict[str, int]], pid_map: Dict[str, str], out_path: str, raw_path: Optional[str] = None) -> None:
     rows, rows_raw = [], []
     for r in lineups:
         def cell(idx: Optional[int]) -> str:
-            if idx is None: return ""
+            if idx is None:
+                return ""
             row = pool.loc[idx]
-            return decorate(row["name"], row.get("team",""), row.get("pos",""), pid_map)
+            return _decorate(row["name"], row.get("team", ""), row.get("pos", ""), pid_map)
+
         row = {
             "C1": cell(r.get("C1")), "C2": cell(r.get("C2")),
             "W1": cell(r.get("W1")), "W2": cell(r.get("W2")), "W3": cell(r.get("W3")),
             "D1": cell(r.get("D1")), "D2": cell(r.get("D2")),
-            "G":  cell(r.get("G")),  "UTIL": cell(r.get("UTIL")),
+            "G": cell(r.get("G")), "UTIL": cell(r.get("UTIL")),
         }
         idxs = [i for i in r.values() if i is not None]
-        row["TotalSalary"] = int(pool.loc[idxs,"salary"].sum())
-        row["ProjPoints"]  = round(float(pool.loc[idxs,"proj_points_rand"].sum()), 3)
+        row["TotalSalary"] = int(pool.loc[idxs, "salary"].sum())
+        row["ProjPoints"] = round(float(pool.loc[idxs, "proj_points_rand"].sum()), 3)
         rows.append(row)
         rows_raw.append({k: (pool.loc[r[k], "name"] if r.get(k) is not None else "") for k in ["C1","C2","W1","W2","W3","D1","D2","G","UTIL"]})
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -277,18 +392,21 @@ def export_lineups(pool: pd.DataFrame, lineups: List[Dict[str,int]], pid_map: Di
 
 def _load_config(path: Optional[str]) -> Dict:
     if not path:
-        for c in ("config.json","sample.config.json"):
+        for c in ("config.json", "sample.config.json"):
             if os.path.exists(c):
-                with open(c,"r",encoding="utf-8") as f: return json.load(f)
+                with open(c, "r", encoding="utf-8") as f:
+                    return json.load(f)
         return {}
-    if path.lower().endswith((".yaml",".yml")):
+    if path.lower().endswith((".yaml", ".yml")):
         import yaml
-        with open(path,"r",encoding="utf-8") as f: return yaml.safe_load(f) or {}
-    with open(path,"r",encoding="utf-8") as f: return json.load(f)
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def parse_args():
-    ap = argparse.ArgumentParser("NHL Optimizer (DK player_ids support)")
+    ap = argparse.ArgumentParser("NHL Optimizer (robust header mapping)")
     ap.add_argument("--date", required=True)
     ap.add_argument("--labs-dir", default="dk_data")
     ap.add_argument("--out", default="out/lineups_{date}.csv")
@@ -310,17 +428,19 @@ def main():
     date = args.date
     labs_dir = args.labs_dir
     out_path = (args.out or "out/lineups_{date}.csv").format(date=date)
-    raw_path = out_path.replace(".csv","_raw.csv") if args.export_raw else None
+    raw_path = out_path.replace(".csv", "_raw.csv") if args.export_raw else None
 
     df = load_labs_merged(labs_dir, date)
+
+    # Early counts — should now show full goalie count
+    counts = df.groupby("pos")["name"].count().to_dict() if not df.empty else {}
+    LOG.info("Pool counts: %s", counts)
+
     rbp = cfg.get("randomness_pct_by_pos", DEFAULT_RANDOMNESS_BY_POS)
     df = apply_randomness(df, rbp)
 
-    # Optional feasibility logs
     feas_min, feas_max, ok, counts = _approx_feasible_salary_range(df)
-    LOG.info("Pool counts: %s", counts)
-    LOG.info("Approx feasible salary range: min=%d, max=%d | requested [%d, %d]",
-             feas_min, feas_max, args.min_salary, args.max_salary)
+    LOG.info("Approx feasible salary range: min=%d, max=%d | requested [%d, %d]", feas_min, feas_max, args.min_salary, args.max_salary)
     if not ok:
         LOG.error("Pool incomplete by position → infeasible. Ensure C(2), W(3), D(2), G(1) are available.")
         sys.exit(2)
@@ -342,8 +462,9 @@ def main():
         LOG.error("No lineups produced — try --min-salary 45000 or set config.attempts_multiplier to 1200; also verify position counts.")
         sys.exit(2)
 
-    # 🔹 NEW: Load player IDs from DK export-style OR simple mapping
-    pid_map = load_player_ids_any(os.path.join("dk_data", "player_ids.csv"))
+    pid_map: Dict[str, str] = {}
+    if load_player_ids_any:
+        pid_map = load_player_ids_any(os.path.join("dk_data", "player_ids.csv"))
 
     export_lineups(df, lineups, pid_map, out_path, raw_path=raw_path)
 
