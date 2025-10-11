@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import glob
@@ -6,6 +7,9 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+
+LOG = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -379,3 +383,314 @@ def group_pp1(players: pd.DataFrame) -> Dict[str, List[int]]:
     for idx, row in pp1.iterrows():
         groups.setdefault(row["Team"], []).append(idx)
     return groups
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Simulator helpers (public)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def normalize_name(name: str) -> str:
+    """Public wrapper around the name normalizer."""
+
+    return _normalize_name(name)
+
+
+def normalize_position(pos: Optional[str]) -> str:
+    if pos is None or (isinstance(pos, float) and np.isnan(pos)):
+        return ""
+    text = str(pos).strip().upper()
+    matches = re.findall(r"(C|W|D|G)", text)
+    if matches:
+        return matches[0]
+    if text in {"LW", "RW"}:
+        return "W"
+    return text
+
+
+def _empty_player_reference() -> pd.DataFrame:
+    cols = [
+        "Name",
+        "Pos",
+        "Team",
+        "Opp",
+        "Salary",
+        "Proj",
+        "Ceiling",
+        "Full",
+        "PP",
+        "Ownership",
+        "Actual",
+        "PlayerID",
+        "full_line_group",
+        "pp_unit",
+    ]
+    return pd.DataFrame(columns=cols)
+
+
+def load_player_reference(path: str) -> pd.DataFrame:
+    """Load a generic player pool CSV and normalize common columns."""
+
+    if not path or not os.path.exists(path):
+        LOG.warning("Player pool file %s missing; returning empty frame", path)
+        return _empty_player_reference()
+
+    if os.path.isdir(path):
+        files = sorted(glob.glob(os.path.join(path, "*.csv")))
+        frames = []
+        for fp in files:
+            try:
+                frames.append(pd.read_csv(fp))
+            except Exception as exc:
+                LOG.warning("Failed to read %s: %s", fp, exc)
+        if not frames:
+            LOG.warning("No readable CSV files found under %s", path)
+            return _empty_player_reference()
+        df = pd.concat(frames, ignore_index=True)
+    else:
+        df = pd.read_csv(path)
+    if df.empty:
+        return _empty_player_reference()
+
+    name_col = _pick(df, "Name", "Player", "Player Name")
+    pos_col = _pick(df, "Pos", "Position")
+    team_col = _pick(df, "Team", "TeamAbbrev", "Team Abbrev", "Tm")
+    opp_col = _pick(df, "Opp", "Opponent", "Opp Team")
+    salary_col = _pick(df, "Salary", "Sal")
+    proj_col = _pick(df, "Proj", "Projection", "Fpts Proj", "Fpts")
+    ceil_col = _pick(df, "Ceiling", "Ceil")
+    own_col = _pick(df, "Ownership", "Own", "Proj Own", "Proj. Own", "Own%")
+    full_col = _pick(df, "Full", "EV", "Even Strength Line", "Line")
+    pp_col = _pick(df, "PP", "Power Play", "PP Unit")
+    actual_col = _pick(df, "Actual", "Fpts Act", "Fpts", "Points", "Score")
+    id_col = _pick(df, "PlayerID", "ID", "Player Id", "player_id")
+
+    out = pd.DataFrame(
+        {
+            "Name": df[name_col].astype(str).str.strip() if name_col else df.index.astype(str),
+            "Pos": df[pos_col] if pos_col else np.nan,
+            "Team": df[team_col] if team_col else np.nan,
+            "Opp": df[opp_col] if opp_col else np.nan,
+            "Salary": df[salary_col].map(_coerce_num) if salary_col else np.nan,
+            "Proj": df[proj_col].map(_coerce_num) if proj_col else np.nan,
+            "Ceiling": df[ceil_col].map(_coerce_num) if ceil_col else np.nan,
+            "Full": df[full_col] if full_col else np.nan,
+            "PP": df[pp_col] if pp_col else np.nan,
+            "Ownership": df[own_col].map(_coerce_num) if own_col else np.nan,
+            "Actual": df[actual_col].map(_coerce_num) if actual_col else np.nan,
+            "PlayerID": df[id_col] if id_col else np.nan,
+        }
+    )
+
+    out["Pos"] = out["Pos"].map(normalize_position)
+    out["Team"] = out["Team"].astype(str).str.upper().str.strip()
+    out["Opp"] = out["Opp"].astype(str).str.upper().str.strip()
+    out.loc[out["Opp"].isin(["", "NONE", "NAN"]), "Opp"] = np.nan
+
+    out["Full"] = out["Full"].astype(str).replace({"nan": np.nan, "None": np.nan})
+    out["Full"] = out["Full"].where(out["Full"].notna(), None)
+    out["Full"] = out["Full"].map(lambda x: _parse_full(x) if pd.notna(x) else np.nan)
+    out["pp_unit"] = out["PP"].map(_pp_to_int)
+
+    out["Name"] = out["Name"].astype(str).str.strip()
+    out["NameNorm"] = out["Name"].map(_normalize_name)
+
+    def _game_key(row):
+        team = row["Team"]
+        opp = row["Opp"]
+        if pd.notna(team) and pd.notna(opp) and opp:
+            a, b = sorted([str(team), str(opp)])
+            return f"{a}@{b}"
+        return None
+
+    out["GameKey"] = out.apply(_game_key, axis=1)
+    out["IsSkater"] = out["Pos"].isin(["C", "W", "D"])
+    out["IsGoalie"] = out["Pos"] == "G"
+    out["full_line_group"] = np.where(
+        out["IsSkater"],
+        out.apply(
+            lambda r: f"{r['Team']}:{r['Full']}" if pd.notna(r.get("Full")) else np.nan,
+            axis=1,
+        ),
+        np.nan,
+    )
+    return out
+
+
+def _meta_pick(meta: Dict[str, object], *keys: str):
+    for key in keys:
+        if key in meta and not pd.isna(meta[key]):
+            return meta[key]
+    return None
+
+
+def normalize_lineup_player(
+    name: str,
+    meta: Dict[str, object],
+    player_lookup: Dict[str, List[pd.Series]],
+) -> Dict[str, object]:
+    norm_name = normalize_name(name)
+    meta_lower = {str(k).lower(): v for k, v in meta.items()}
+
+    meta_team = _meta_pick(meta_lower, "team", "teamabbr", "team_abbrev", "tm")
+    meta_pos = _meta_pick(meta_lower, "pos", "position", "slot", "roster")
+    meta_opp = _meta_pick(meta_lower, "opp", "opponent")
+    meta_salary = _coerce_num(_meta_pick(meta_lower, "salary", "sal"))
+    meta_proj = _coerce_num(_meta_pick(meta_lower, "proj", "projection", "fpts proj", "fpts"))
+    meta_ceil = _coerce_num(_meta_pick(meta_lower, "ceiling", "ceil"))
+    meta_actual = _coerce_num(_meta_pick(meta_lower, "actual", "fpts act", "points", "score"))
+    meta_own = _coerce_num(_meta_pick(meta_lower, "ownership", "own", "proj own", "own%"))
+
+    candidates = player_lookup.get(norm_name, [])
+    best_row: Optional[pd.Series] = None
+    best_score = -1
+    team_upper = str(meta_team).upper().strip() if meta_team else ""
+    pos_upper = normalize_position(meta_pos)
+
+    for row in candidates:
+        score = 0
+        row_team = str(row.get("Team", "")).upper().strip()
+        row_pos = normalize_position(row.get("Pos"))
+        if team_upper and row_team == team_upper:
+            score += 3
+        if pos_upper and row_pos == pos_upper:
+            score += 2
+        salary = row.get("Salary")
+        if meta_salary is not None and pd.notna(salary) and abs(float(salary) - meta_salary) <= 100:
+            score += 1
+        if score > best_score:
+            best_score = score
+            best_row = row
+
+    def _fallback(value, row_value):
+        return value if value not in (None, "", np.nan) else row_value
+
+    row = best_row if best_row is not None else (candidates[0] if candidates else pd.Series())
+    row_pos = normalize_position(row.get("Pos")) if isinstance(row, pd.Series) else ""
+    row_team = str(row.get("Team", "")).upper().strip() if isinstance(row, pd.Series) else ""
+    row_opp = str(row.get("Opp", "")).upper().strip() if isinstance(row, pd.Series) else ""
+
+    salary = _fallback(meta_salary, row.get("Salary") if isinstance(row, pd.Series) else None)
+    projection = _fallback(meta_proj, row.get("Proj") if isinstance(row, pd.Series) else None)
+    ceiling = _fallback(meta_ceil, row.get("Ceiling") if isinstance(row, pd.Series) else None)
+    actual = _fallback(meta_actual, row.get("Actual") if isinstance(row, pd.Series) else None)
+    ownership = _fallback(meta_own, row.get("Ownership") if isinstance(row, pd.Series) else None)
+    full = row.get("Full") if isinstance(row, pd.Series) else None
+    pp_unit = row.get("pp_unit") if isinstance(row, pd.Series) else None
+    player_id = row.get("PlayerID") if isinstance(row, pd.Series) else None
+
+    def _clean_float(val):
+        if val in (None, "", "nan"):
+            return None
+        try:
+            return float(val)
+        except Exception:
+            return None
+
+    data = {
+        "name": str(name).strip(),
+        "position": normalize_position(_fallback(pos_upper, row_pos)) or "",
+        "team": (_fallback(team_upper, row_team) or "").upper(),
+        "opp": (_fallback(str(meta_opp).upper().strip() if meta_opp else None, row_opp) or None),
+        "salary": _clean_float(salary),
+        "projection": _clean_float(projection),
+        "ceiling": _clean_float(ceiling),
+        "actual": _clean_float(actual),
+        "ownership": _clean_float(ownership),
+        "full": full if full not in (np.nan, "nan") else None,
+        "pp_unit": int(pp_unit) if pp_unit not in (None, np.nan, "") else None,
+        "player_id": str(player_id) if player_id not in (None, np.nan, "") else None,
+    }
+
+    if data["opp"] == "":
+        data["opp"] = None
+
+    return data
+
+
+def apply_external_ownership(
+    players_df: pd.DataFrame,
+    ownership_path: Optional[str],
+    ownership_column: Optional[str] = None,
+) -> pd.DataFrame:
+    if not ownership_path or not os.path.exists(ownership_path):
+        if players_df.empty:
+            return pd.DataFrame(columns=["Name", "Team", "Pos", "Ownership"])
+        out = players_df.copy()
+        out["Ownership"] = np.nan
+        return out
+
+    own_df = pd.read_csv(ownership_path)
+    if own_df.empty:
+        if players_df.empty:
+            return pd.DataFrame(columns=["Name", "Team", "Pos", "Ownership"])
+        players_df = players_df.copy()
+        players_df["Ownership"] = np.nan
+        return players_df
+
+    target_col = None
+    if ownership_column:
+        target_col = _pick(own_df, ownership_column)
+    if not target_col:
+        target_col = _pick(own_df, "Ownership", "Own", "Proj Own", "Proj. Own", "Own%")
+    if not target_col:
+        raise ValueError("Unable to locate ownership column in ownership file")
+
+    name_col = _pick(own_df, "Name", "Player", "Player Name")
+    if not name_col:
+        raise ValueError("Ownership file missing a name column")
+    team_col = _pick(own_df, "Team", "TeamAbbrev", "Team Abbrev", "Tm")
+    pos_col = _pick(own_df, "Pos", "Position")
+
+    normalized = pd.DataFrame(
+        {
+            "Name": own_df[name_col].astype(str).str.strip(),
+            "Team": own_df[team_col].astype(str).str.upper().str.strip() if team_col else np.nan,
+            "Pos": own_df[pos_col].astype(str).str.strip() if pos_col else np.nan,
+            "Ownership": pd.to_numeric(own_df[target_col], errors="coerce"),
+        }
+    )
+    normalized["NameNorm"] = normalized["Name"].map(_normalize_name)
+    normalized["TeamNorm"] = normalized["Team"].astype(str).str.upper().str.strip()
+    normalized["PosNorm"] = normalized["Pos"].map(normalize_position)
+
+    if players_df.empty:
+        return normalized[["Name", "Team", "Pos", "Ownership"]]
+
+    merged = players_df.copy()
+    existing_ownership = merged["Ownership"] if "Ownership" in merged.columns else None
+    if "Ownership" in merged.columns:
+        merged = merged.drop(columns=["Ownership"])
+    merged["NameNorm"] = merged["Name"].map(_normalize_name)
+    merged["TeamNorm"] = merged["Team"].astype(str).str.upper().str.strip()
+    merged["PosNorm"] = merged["Pos"].map(normalize_position)
+
+    merge_cols = ["NameNorm"]
+    if normalized["TeamNorm"].notna().any():
+        merge_cols.append("TeamNorm")
+    if normalized["PosNorm"].notna().any():
+        merge_cols.append("PosNorm")
+
+    merged = merged.merge(
+        normalized[merge_cols + ["Ownership"]],
+        on=merge_cols,
+        how="left",
+    )
+
+    if "Ownership" not in merged.columns:
+        merged["Ownership"] = np.nan
+
+    if existing_ownership is not None:
+        merged["Ownership"] = merged["Ownership"].fillna(existing_ownership)
+
+    if merged["Ownership"].isna().any():
+        fallback = normalized.groupby("NameNorm")["Ownership"].mean()
+        missing_mask = merged["Ownership"].isna()
+        merged.loc[missing_mask, "Ownership"] = merged.loc[missing_mask, "NameNorm"].map(fallback)
+        still_missing = merged[missing_mask & merged["Ownership"].isna()]
+        if not still_missing.empty:
+            unresolved = sorted(set(still_missing["Name"].tolist()))
+            LOG.warning("Ownership unresolved for %d players: %s", len(unresolved), ", ".join(unresolved[:10]))
+
+    merged.drop(columns=["NameNorm", "TeamNorm", "PosNorm"], inplace=True)
+    return merged

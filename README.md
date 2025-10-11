@@ -16,12 +16,15 @@ python cli/nhl_opt.py ^
   --max-vs-goalie 0 ^
   --min-salary 49500 --diversify 2
 
-# SIMULATOR (Monte Carlo the resulting CSV)
-python cli/nhl_sim.py ^
-  --lineups "out/lineups_2021-10-13.csv" ^
-  --date 2021-10-13 ^
-  --sims 20000 ^
-  --out "out/sim_report_2021-10-13.csv"
+# NHL GPP SIMULATOR (NFL-style CLI)
+# Standard NHL sim (no ownership)
+python cli/nhl_sim.py --site DK --field-size 20000 --iterations 5000 \
+  --lineups out/lineups_2025-10-09.csv --players dk_data --outdir output
+
+# With ownership and fixed seed
+python cli/nhl_sim.py --site DK --field-size 20000 --iterations 10000 \
+  --lineups out/lineups_2025-10-09.csv --players dk_data \
+  --ownership-file dk_data/ownership_2025-10-09.csv --seed 1337 --outdir output
 
 ## FantasyLabs inputs
 By default the CLIs look for FantasyLabs exports inside the repository's `dk_data` folder.
