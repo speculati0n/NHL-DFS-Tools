@@ -15,6 +15,11 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+try:
+    import pulp
+except Exception:  # pragma: no cover - allow running without ILP fallback
+    pulp = None
+
 # Optional DK export mapping support (graceful if missing)
 try:
     from nhl_tools.id_mapping import load_player_ids_any, find_pid
@@ -195,75 +200,228 @@ def _approx_feasible_salary_range(pool: pd.DataFrame) -> tuple[int,int,bool,Dict
     return feas_min, feas_max, ok, counts
 
 def _choose(pool, pos, chosen, remain_cap):
-    cand = pool[(pool["pos"]==pos) & (~pool.index.isin(chosen)) & (pool["salary"]<=remain_cap)]
-    if cand.empty: return None
-    return int((cand["proj_points_rand"] + np.random.rand(len(cand))*1e-6).idxmax())
+    cand = pool[(pool["pos"] == pos) & (~pool.index.isin(chosen)) & (pool["salary"] <= remain_cap)]
+    if cand.empty:
+        return None
+    return int((cand["proj_points_rand"] + np.random.rand(len(cand)) * 1e-6).idxmax())
 
 def _try_salary_steer(pool, roster_idx: Dict[str,int], target_min: int, current_salary: int, cap: int):
-    if current_salary >= target_min: return roster_idx, current_salary
-    order = ["UTIL","W3","W2","W1","D2","D1","C2","C1"]
+    """
+    Attempt to increase lineup salary to meet ``target_min`` while staying under ``cap``.
+
+    The old heuristic only made one pass through the roster, swapping in a
+    slightly higher-salary player whenever possible.  With very wide salary
+    distributions this left thousands of dollars unused, which in turn caused
+    the optimizer to fail whenever a user requested a tight salary floor (e.g.
+    48k-50k).
+
+    We now construct a small set of candidate upgrades for each roster slot and
+    search combinations of one, two, or three simultaneous replacements.  This
+    effectively solves a tiny knapsack problem and reliably finds an upgrade
+    that meets the minimum salary (if one exists) without exploding the search
+    space.
+    """
+
+    if current_salary >= target_min:
+        return roster_idx, current_salary
+
+    MAX_CANDIDATES_PER_SLOT = 25
+    order = ["UTIL", "G", "W3", "W2", "W1", "D2", "D1", "C2", "C1"]
+
+    used = set(roster_idx.values())
+    current_proj = float(pool.loc[list(roster_idx.values()), "proj_points_rand"].sum())
+
+    slot_candidates: Dict[str, List[tuple[int, int, float]]] = {}
+    slot_delta_cap: Dict[str, int] = {}
     for slot in order:
-        i = roster_idx.get(slot)
-        if i is None: continue
-        row = pool.loc[i]
-        pos = row["pos"]
-        remain = cap - (current_salary - int(row["salary"]))
-        cand = pool[(pool["pos"]==pos) & (pool.index!=i) & (pool["salary"]<=remain)]
-        cand = cand[cand["salary"] > int(row["salary"])].copy()
-        if cand.empty: continue
-        j = int((cand["proj_points_rand"] + np.random.rand(len(cand))*1e-6).idxmax())
-        delta = int(pool.loc[j,"salary"]) - int(row["salary"])
-        roster_idx[slot] = j
-        current_salary += delta
-        if current_salary >= target_min: break
+        idx = roster_idx.get(slot)
+        if idx is None:
+            continue
+
+        row = pool.loc[idx]
+        base_salary = int(row["salary"])
+        remain = cap - (current_salary - base_salary)
+
+        cand = pool[(pool["pos"] == row["pos"]) & (~pool.index.isin(used - {idx})) & (pool["salary"] <= remain)]
+        cand = cand[cand["salary"] > base_salary].copy()
+        if cand.empty:
+            continue
+
+        cand = cand.sort_values(["salary", "proj_points_rand"], ascending=[False, False]).head(MAX_CANDIDATES_PER_SLOT)
+        slot_candidates[slot] = [
+            (int(i), int(pool.loc[i, "salary"]) - base_salary, float(pool.loc[i, "proj_points_rand"]) - float(row["proj_points_rand"]))
+            for i in cand.index
+        ]
+        slot_delta_cap[slot] = max(d for _, d, _ in slot_candidates[slot]) if slot_candidates[slot] else 0
+
+    if not slot_candidates:
+        return roster_idx, current_salary
+
+    slots = [slot for slot in order if slot in slot_candidates]
+    if not slots:
+        return roster_idx, current_salary
+
+    suffix_max_delta = [0] * (len(slots) + 1)
+    for i in range(len(slots) - 1, -1, -1):
+        suffix_max_delta[i] = suffix_max_delta[i + 1] + slot_delta_cap.get(slots[i], 0)
+
+    best_plan: Optional[List[tuple[str, tuple[int, int, float]]]] = None
+    best_salary = current_salary
+    best_proj = current_proj
+
+    def dfs(idx: int, salary: int, proj: float, plan: List[tuple[str, tuple[int, int, float]]], used_players: set[int]) -> None:
+        nonlocal best_plan, best_salary, best_proj
+
+        if salary >= target_min:
+            if best_plan is None or proj > best_proj or (np.isclose(proj, best_proj) and salary > best_salary):
+                best_plan = list(plan)
+                best_salary = salary
+                best_proj = proj
+            return
+
+        if idx >= len(slots):
+            return
+
+        remaining_cap_room = suffix_max_delta[idx]
+        if salary + remaining_cap_room < target_min:
+            return
+
+        slot = slots[idx]
+
+        # Option: skip replacing this slot.
+        dfs(idx + 1, salary, proj, plan, used_players)
+
+        for cand in slot_candidates[slot]:
+            cand_idx, delta_sal, delta_proj = cand
+            if cand_idx in used_players:
+                continue
+            new_salary = salary + delta_sal
+            if new_salary > cap:
+                continue
+            if new_salary + suffix_max_delta[idx + 1] < target_min:
+                continue
+            used_players.add(cand_idx)
+            plan.append((slot, cand))
+            dfs(idx + 1, new_salary, proj + delta_proj, plan, used_players)
+            plan.pop()
+            used_players.remove(cand_idx)
+
+    dfs(0, current_salary, current_proj, [], set())
+
+    if best_plan is None:
+        return roster_idx, current_salary
+
+    for slot, (idx, delta_sal, _) in best_plan:
+        old_idx = roster_idx.get(slot)
+        if old_idx is not None:
+            roster_idx[slot] = idx
+            used.discard(old_idx)
+            used.add(idx)
+    current_salary = best_salary
+
     return roster_idx, current_salary
 
+
+def _assign_slots(lineup_indices: List[int], pool: pd.DataFrame) -> Dict[str, int]:
+    slots: Dict[str, int] = {}
+    leftovers: List[int] = []
+
+    def take(position: str, required_slots: List[str]) -> None:
+        players = [i for i in lineup_indices if pool.loc[i, "pos"] == position]
+        players.sort(
+            key=lambda j: (float(pool.loc[j, "proj_points_rand"]), int(pool.loc[j, "salary"])),
+            reverse=True,
+        )
+        for slot in required_slots:
+            if not players:
+                raise ValueError(f"Insufficient {position} players for slot {slot}")
+            slots[slot] = players.pop(0)
+        leftovers.extend(players)
+
+    take("G", ["G"])
+    take("C", ["C1", "C2"])
+    take("W", ["W1", "W2", "W3"])
+    take("D", ["D1", "D2"])
+
+    util_pool = [i for i in leftovers if pool.loc[i, "pos"] in {"C", "W", "D"}]
+    util_pool.sort(
+        key=lambda j: (float(pool.loc[j, "proj_points_rand"]), int(pool.loc[j, "salary"])),
+        reverse=True,
+    )
+    if len(util_pool) != 1:
+        raise ValueError("Expected exactly one skater for the UTIL slot")
+    slots["UTIL"] = util_pool[0]
+    return slots
+
+
 def build_lineups(pool: pd.DataFrame, num: int, min_salary: int, max_salary: int, attempts_multiplier: int = 600) -> List[Dict[str,int]]:
-    lineups: List[Dict[str,int]] = []
-    attempts = 0
-    max_attempts = max(1000, num * attempts_multiplier)
-    while len(lineups) < num and attempts < max_attempts:
-        attempts += 1
-        chosen_idx: List[int] = []
-        r: Dict[str,int] = {}
-        sal = 0
+    if pulp is None:
+        LOG.error("PuLP solver not available; cannot build lineups deterministically.")
+        return []
 
-        gi = _choose(pool, "G", chosen_idx, max_salary - sal)
-        if gi is None: continue
-        r["G"] = gi; chosen_idx.append(gi); sal += int(pool.loc[gi,"salary"])
+    players = list(pool.index)
+    salary = pool["salary"].astype(int)
+    proj = pool["proj_points_rand"].astype(float)
+    pos_series = pool["pos"].astype(str)
 
-        for s in ["C1","C2"]:
-            i = _choose(pool, "C", chosen_idx, max_salary - sal)
-            if i is None: r = {}; break
-            r[s] = i; chosen_idx.append(i); sal += int(pool.loc[i,"salary"])
-        if not r: continue
+    lineups: List[Dict[str, int]] = []
+    used_name_sets: set[tuple[str, ...]] = set()
+    previous_lineups: List[set[int]] = []
 
-        for s in ["D1","D2"]:
-            i = _choose(pool, "D", chosen_idx, max_salary - sal)
-            if i is None: r = {}; break
-            r[s] = i; chosen_idx.append(i); sal += int(pool.loc[i,"salary"])
-        if not r: continue
+    while len(lineups) < num:
+        prob = pulp.LpProblem("nhl_lineup", pulp.LpMaximize)
+        x: Dict[int, pulp.LpVariable] = {
+            i: pulp.LpVariable(f"x_{i}", lowBound=0, upBound=1, cat="Binary") for i in players
+        }
 
-        for s in ["W1","W2","W3"]:
-            i = _choose(pool, "W", chosen_idx, max_salary - sal)
-            if i is None: r = {}; break
-            r[s] = i; chosen_idx.append(i); sal += int(pool.loc[i,"salary"])
-        if not r: continue
+        noise = np.random.rand(len(players)) * 1e-4
+        prob += pulp.lpSum((proj.loc[i] + noise[idx]) * x[i] for idx, i in enumerate(players))
 
-        util_pool = pool[(pool["pos"].isin(["C","W","D"])) & (~pool.index.isin(chosen_idx)) & (pool["salary"]<= (max_salary - sal))]
-        if util_pool.empty: continue
-        util_i = int((util_pool["proj_points_rand"] + np.random.rand(len(util_pool))*1e-6).idxmax())
-        r["UTIL"] = util_i; chosen_idx.append(util_i); sal += int(pool.loc[util_i,"salary"])
+        prob += pulp.lpSum(salary.loc[i] * x[i] for i in players) <= max_salary
+        prob += pulp.lpSum(salary.loc[i] * x[i] for i in players) >= min_salary
+        prob += pulp.lpSum(x[i] for i in players if pos_series.loc[i] == "C") >= 2
+        prob += pulp.lpSum(x[i] for i in players if pos_series.loc[i] == "C") <= 3
+        prob += pulp.lpSum(x[i] for i in players if pos_series.loc[i] == "W") >= 3
+        prob += pulp.lpSum(x[i] for i in players if pos_series.loc[i] == "W") <= 4
+        prob += pulp.lpSum(x[i] for i in players if pos_series.loc[i] == "D") >= 2
+        prob += pulp.lpSum(x[i] for i in players if pos_series.loc[i] == "D") <= 3
+        prob += pulp.lpSum(x[i] for i in players if pos_series.loc[i] == "G") == 1
+        prob += pulp.lpSum(x[i] for i in players) == 9
 
-        if sal < min_salary:
-            r, sal = _try_salary_steer(pool, r, min_salary, sal, max_salary)
+        for prev in previous_lineups:
+            prob += pulp.lpSum(x[i] for i in prev) <= 8
 
-        if sal < min_salary or sal > max_salary: continue
+        status = prob.solve(pulp.PULP_CBC_CMD(msg=False))
+        if status != pulp.LpStatusOptimal:
+            break
 
-        name_set = tuple(sorted(pool.loc[list(r.values()), "name_key"].tolist()))
-        if any(tuple(sorted(pool.loc[list(x.values()), "name_key"].tolist())) == name_set for x in lineups):
+        lineup_indices = [i for i in players if x[i].value() is not None and x[i].value() > 0.5]
+        if len(lineup_indices) != 9:
+            break
+
+        sal_total = int(salary.loc[lineup_indices].sum())
+        if sal_total < min_salary or sal_total > max_salary:
+            previous_lineups.append(set(lineup_indices))
             continue
-        lineups.append(r)
+
+        name_set = tuple(sorted(pool.loc[lineup_indices, "name_key"].tolist()))
+        if name_set in used_name_sets:
+            previous_lineups.append(set(lineup_indices))
+            continue
+
+        try:
+            roster = _assign_slots(lineup_indices, pool)
+        except ValueError:
+            previous_lineups.append(set(lineup_indices))
+            continue
+
+        lineups.append(roster)
+        used_name_sets.add(name_set)
+        previous_lineups.append(set(lineup_indices))
+
+    if len(lineups) < num:
+        LOG.warning("Generated %d lineups out of requested %d using ILP fallback", len(lineups), num)
+
     return lineups
 
 def _decorate(name: str, team: str, pos: str, pid_map: Dict[str,str]) -> str:
