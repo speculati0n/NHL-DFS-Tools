@@ -14,6 +14,7 @@ import logging
 import unicodedata
 from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -56,8 +57,18 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 # ───────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ───────────────────────────────────────────────────────────────────────────────
-def _norm_name(s: str) -> str:
-    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode("ascii")
+def _safe_str(x) -> str:
+    # Robust cast of possibly NaN/float/None to string
+    if x is None:
+        return ""
+    if isinstance(x, float) and np.isnan(x):
+        return ""
+    return str(x)
+
+
+def _norm_name(x) -> str:
+    s = _safe_str(x)
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
     s = re.sub(r"[^\w\s]", "", s)
     s = re.sub(r"\s+", " ", s).strip().lower()
     s = re.sub(r"\b(jr|sr|ii|iii|iv)\b\.?", "", s).strip()
@@ -65,13 +76,14 @@ def _norm_name(s: str) -> str:
 
 
 def _pid_key(name: Optional[str], team: Optional[str], pos: Optional[str]) -> str:
-    return f"{_norm_name(name)}|{(team or '').strip().upper()}|{(pos or '').strip().upper()}"
+    return f"{_norm_name(name)}|{_safe_str(team).strip().upper()}|{_safe_str(pos).strip().upper()}"
 
 
 def add_quality_columns(df: pd.DataFrame, ceil_mult: float = 1.6, floor_mult: float = 0.55) -> pd.DataFrame:
     """Add Ceil/Floor columns based on a simple multiplier of proj_points."""
     out = df.copy()
     base = out.get("proj_points", pd.Series([0.0] * len(out), index=out.index))
+    base = pd.to_numeric(base, errors="coerce").fillna(0.0)
     out["Ceil"] = base.astype(float) * float(ceil_mult)
     out["Floor"] = base.astype(float) * float(floor_mult)
     return out
@@ -86,7 +98,7 @@ def load_player_ids(path: str) -> Dict[str, str]:
     with open(path, newline="", encoding="utf-8") as f:
         r = csv.DictReader(f)
         for row in r:
-            pid = str(row.get("player_id", "")).strip()
+            pid = _safe_str(row.get("player_id", "")).strip()
             name = row.get("name", "")
             team = row.get("team", "")
             pos = row.get("pos", "")
@@ -97,7 +109,7 @@ def load_player_ids(path: str) -> Dict[str, str]:
 
 def decorate(name: str, team: str, pos: str, mp: Dict[str, str]) -> str:
     pid = mp.get(_pid_key(name, team, pos), "")
-    return f"{name} ({pid})"
+    return f"{_safe_str(name)} ({pid})"
 
 
 def _read_labs_one(path: str, pos: str) -> pd.DataFrame:
@@ -111,26 +123,36 @@ def _read_labs_one(path: str, pos: str) -> pd.DataFrame:
         if need not in df.columns:
             raise ValueError(f"{path}: missing required column '{need}' after rename")
 
+    # sanitize critical fields (avoid NaN -> float propagation)
+    df["name"] = df["name"].apply(_safe_str)
+    df["team"] = df["team"].apply(_safe_str)
+    if "opp" in df.columns:
+        df["opp"] = df["opp"].apply(_safe_str)
+
     # salary clean
     df["salary"] = (
         df["salary"]
-        .astype(str)
+        .apply(_safe_str)
         .str.replace(",", "", regex=False)
         .str.extract(r"(\d+)", expand=False)
         .fillna("0")
         .astype(int)
     )
 
+    # projections/ownership defaults
     if "proj_points" not in df.columns:
         df["proj_points"] = 0.0
+    df["proj_points"] = pd.to_numeric(df["proj_points"], errors="coerce").fillna(0.0)
+
     if "projected_own" not in df.columns:
         df["projected_own"] = 0.0
+    df["projected_own"] = pd.to_numeric(df["projected_own"], errors="coerce").fillna(0.0)
 
     df["pos"] = pos
     df["name_key"] = df["name"].map(_norm_name)
-    df["team"] = df["team"].astype(str).str.upper().str.strip()
+    df["team"] = df["team"].str.upper().str.strip()
     if "opp" in df.columns:
-        df["opp"] = df["opp"].astype(str).str.upper().str.strip()
+        df["opp"] = df["opp"].str.upper().str.strip()
     return df
 
 
@@ -155,6 +177,10 @@ def load_labs_merged(labs_dir: str, date: str) -> pd.DataFrame:
     for pos, pth in paths.items():
         frames.append(_read_labs_one(pth, pos))
     full = pd.concat(frames, ignore_index=True)
+
+    # Drop rows with blank names after sanitation to avoid downstream issues
+    full = full[full["name"].str.len() > 0].copy()
+
     full = full.sort_values(["name_key", "pos", "proj_points"], ascending=[True, True, False])
     full = full.drop_duplicates(subset=["name_key", "pos"], keep="first").reset_index(drop=True)
     return full
@@ -163,26 +189,21 @@ def load_labs_merged(labs_dir: str, date: str) -> pd.DataFrame:
 def apply_randomness(df: pd.DataFrame, randomness_by_pos: Dict[str, float] | None) -> pd.DataFrame:
     rbp = randomness_by_pos or DEFAULT_RANDOMNESS_BY_POS
     out = df.copy()
-    jitter = []
-    for _, r in out.iterrows():
-        pct = float(rbp.get(r["pos"], 0.0))
-        # uniform ±pct% around the base projection
-        eps = (2.0 * (pd.np.random.rand() - 0.5)) * (pct / 100.0)  # avoids importing random
-        jitter.append(float(r["proj_points"]) * (1.0 + eps))
-    out["proj_points_rand"] = jitter
+    base = pd.to_numeric(out["proj_points"], errors="coerce").fillna(0.0).astype(float).values
+    pos = out["pos"].astype(str).values
+    jittered = []
+    for i in range(len(out)):
+        pct = float(rbp.get(pos[i], 0.0))
+        eps = (np.random.rand() * 2.0 - 1.0) * (pct / 100.0)  # uniform in [-pct, pct] %
+        jittered.append(base[i] * (1.0 + eps))
+    out["proj_points_rand"] = jittered
     return out
 
 
 # ───────────────────────────────────────────────────────────────────────────────
 # SIMPLE GREEDY OPTIMIZER (baseline; replace with ILP/CP-SAT if desired)
 # ───────────────────────────────────────────────────────────────────────────────
-def _slot_order() -> List[str]:
-    # order matters for greedy fill
-    return ["G", "C", "C", "D", "D", "W", "W", "W", "UTIL"]
-
-
 def _choose_from(pool: pd.DataFrame, pos: str, chosen: List[int], remain_salary: int) -> Optional[int]:
-    # choose best remaining by randomized projection
     cand = pool[(pool["pos"] == pos) & (~pool.index.isin(chosen)) & (pool["salary"] <= remain_salary)]
     if cand.empty:
         return None
@@ -192,9 +213,7 @@ def _choose_from(pool: pd.DataFrame, pos: str, chosen: List[int], remain_salary:
 def build_lineups(pool: pd.DataFrame, num: int, min_salary: int, max_salary: int) -> List[Dict[str, int]]:
     lineups: List[Dict[str, int]] = []
     attempts = 0
-    by_slot = _slot_order()
 
-    # pre-sort by pos not strictly necessary; we always argmax by proj_points_rand
     while len(lineups) < num and attempts < num * 300:
         attempts += 1
         chosen_idx: List[int] = []
@@ -261,7 +280,7 @@ def build_lineups(pool: pd.DataFrame, num: int, min_salary: int, max_salary: int
         if salary < min_salary or salary > max_salary:
             continue
 
-        # Uniqueness: here we treat uniqueness as uniqueness of full set of names
+        # Uniqueness: avoid exact same set of players by name_key
         name_set = tuple(sorted(pool.loc[chosen_idx, "name_key"].tolist()))
         if any(tuple(sorted(pool.loc[list(r.values()), "name_key"].tolist())) == name_set for r in lineups):
             continue
@@ -319,7 +338,7 @@ def export_lineups(
 # ───────────────────────────────────────────────────────────────────────────────
 def _load_config(path: Optional[str]) -> Dict:
     if not path:
-        # NFL-like fallback: sample.config.json then config.json
+        # fallback: config.json or sample.config.json if present (NFL parity)
         for c in ("config.json", "sample.config.json"):
             if os.path.exists(c):
                 with open(c, "r", encoding="utf-8") as f:
