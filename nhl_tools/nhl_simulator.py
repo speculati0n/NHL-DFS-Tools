@@ -241,20 +241,52 @@ def _extract_slot_value(row: pd.Series, column: Optional[str]) -> Optional[str]:
     return str(value).strip()
 
 
-def _extract_slot_metadata(row: pd.Series, column: Optional[str]) -> Dict[str, str]:
+def _extract_slot_metadata(row: pd.Series, slot: str, column: Optional[str]) -> Dict[str, str]:
     """Gather extra metadata columns that share the same prefix as the slot."""
-    if column is None:
+
+    if column is None and not slot:
         return {}
-    base = str(column)
+
+    prefixes = set()
+    if column is not None:
+        column_str = str(column).strip()
+        prefixes.add(column_str)
+        if " " in column_str:
+            prefixes.add(column_str.split(" ")[0])
+    if slot:
+        prefixes.add(str(slot).strip())
+
+    cleaned_prefixes = {p for p in prefixes if p}
+    if not cleaned_prefixes:
+        return {}
+
     meta: Dict[str, str] = {}
     for col, value in row.items():
-        if col == column:
+        if column is not None and col == column:
             continue
         if not isinstance(col, str):
             continue
-        if col.startswith(base + " "):
-            key = col[len(base) + 1 :].strip().lower()
-            meta[key] = value
+        col_str = col.strip()
+        for prefix in cleaned_prefixes:
+            if not prefix:
+                continue
+            if col_str == prefix:
+                continue
+            # Allow separators commonly used in optimizer exports.
+            for separator in (" ", "_", "-", "::"):
+                token = prefix + separator
+                if col_str.startswith(token):
+                    key = col_str[len(token) :].strip().lower()
+                    if key:
+                        meta[key] = value
+                    break
+            else:
+                # Handle compact column names like C1Salary.
+                if col_str.lower().startswith(prefix.lower()) and len(col_str) > len(prefix):
+                    key = col_str[len(prefix) :].strip().lower()
+                    if key:
+                        meta[key] = value
+        # end prefix loop
     return meta
 
 
@@ -298,7 +330,7 @@ def _build_lineups(
             value = _extract_slot_value(row, source_col)
             if not value:
                 continue
-            meta = _extract_slot_metadata(row, source_col)
+            meta = _extract_slot_metadata(row, slot, source_col)
             raw_player = normalize_lineup_player(value, meta, player_lookup)
             player = PlayerRecord(**raw_player)
             if ownership_df is not None and not player.ownership:
@@ -383,14 +415,34 @@ def _group_counts(players: Iterable[PlayerRecord], key_fn) -> Dict[str, List[Pla
 
 def _compute_lineup_metrics(lineup: Lineup) -> None:
     players = list(lineup.players())
-    salary = sum(float(p.salary or 0.0) for p in players)
-    projection = sum(float(p.projection or 0.0) for p in players)
-    actual = sum(float(p.actual or 0.0) for p in players if p.actual is not None)
-    ceiling = sum(float(p.ceiling or 0.0) for p in players if p.ceiling is not None)
 
-    own_vals = [float(p.ownership) for p in players if p.ownership not in (None, np.nan)]
-    own_sum = float(sum(own_vals)) if own_vals else float("nan")
-    own_hhi = float(sum((val / 100.0) ** 2 for val in own_vals)) if own_vals else float("nan")
+    def _coerce_optional(value: object) -> Optional[float]:
+        if value in (None, ""):
+            return None
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return None
+        if math.isnan(num):
+            return None
+        return num
+
+    salary_vals = [_coerce_optional(p.salary) for p in players]
+    projection_vals = [_coerce_optional(p.projection) for p in players]
+    actual_vals = [_coerce_optional(p.actual) for p in players]
+    ceiling_vals = [_coerce_optional(p.ceiling) for p in players]
+
+    salary = sum(val for val in salary_vals if val is not None)
+    projection = sum(val for val in projection_vals if val is not None)
+    actual = sum(val for val in actual_vals if val is not None)
+    ceiling = sum(val for val in ceiling_vals if val is not None)
+
+    own_vals = [_coerce_optional(p.ownership) for p in players]
+    own_clean = [val for val in own_vals if val is not None]
+    own_sum = float(sum(own_clean)) if own_clean else float("nan")
+    own_hhi = (
+        float(sum((val / 100.0) ** 2 for val in own_clean)) if own_clean else float("nan")
+    )
 
     goalie_team = next((p.team for p in players if p.is_goalie), "")
     goalie_conflict = sum(1 for p in players if p.is_skater and p.opp and p.opp == goalie_team)
@@ -419,13 +471,16 @@ def _compute_lineup_metrics(lineup: Lineup) -> None:
     ev_stack_strings = [f"EV:{team}:{len(members)}" for team, members in sorted(ev_groups.items(), key=lambda kv: len(kv[1]), reverse=True) if members]
     pp_stack_strings = [f"PP1:{team}:{len(members)}" for team, members in sorted(pp_groups.items(), key=lambda kv: len(kv[1]), reverse=True) if members]
 
+    actual_metric = actual if actual_vals and any(val is not None for val in actual_vals) else float("nan")
+    ceiling_metric = ceiling if ceiling_vals and any(val is not None for val in ceiling_vals) else float("nan")
+
     lineup.metrics.update(
         {
             "salary": salary,
             "projection": projection,
-            "actual": actual if actual else float("nan"),
-            "ceiling": ceiling if ceiling else float("nan"),
-            "salary_leftover": DK_SALARY_CAP - salary,
+            "actual": actual_metric,
+            "ceiling": ceiling_metric,
+            "salary_leftover": DK_SALARY_CAP - salary if salary_vals else float("nan"),
             "ownership_sum": own_sum,
             "ownership_hhi": own_hhi,
             "goalie_conflict": float(goalie_conflict),
@@ -464,12 +519,23 @@ def _ownership_penalties(metrics: Dict[str, float], cfg: Dict[str, object]) -> f
 
 
 def _adjusted_score(metrics: Dict[str, float], cfg: Dict[str, object]) -> float:
-    score = float(metrics.get("projection", 0.0))
-    score += 0.5 * max(0.0, metrics.get("ev_cluster", 0.0) - 2.0)
-    score += 0.4 * max(0.0, metrics.get("pp1_cluster", 0.0) - 2.0)
-    score -= 3.0 * metrics.get("goalie_conflict", 0.0)
-    score -= 1.0 * min(2.0, metrics.get("bringback_count", 0.0))
-    score -= 0.1 * max(0.0, metrics.get("salary_leftover", 0.0) - 500.0) / 100.0
+    def _metric(key: str, default: float = 0.0) -> float:
+        value = metrics.get(key, default)
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return default
+        if math.isnan(numeric):
+            return default
+        return numeric
+
+    score = _metric("projection", 0.0)
+    score += 0.5 * max(0.0, _metric("ev_cluster", 0.0) - 2.0)
+    score += 0.4 * max(0.0, _metric("pp1_cluster", 0.0) - 2.0)
+    score -= 3.0 * _metric("goalie_conflict", 0.0)
+    score -= 1.0 * min(2.0, _metric("bringback_count", 0.0))
+    salary_left = _metric("salary_leftover", 0.0)
+    score -= 0.1 * max(0.0, salary_left - 500.0) / 100.0
     score -= _ownership_penalties(metrics, cfg)
     return score
 
