@@ -577,6 +577,13 @@ def normalize_lineup_player(
     ownership = _fallback(meta_own, row.get("Ownership") if isinstance(row, pd.Series) else None)
     full = row.get("Full") if isinstance(row, pd.Series) else None
     pp_unit = row.get("pp_unit") if isinstance(row, pd.Series) else None
+    if pd.notna(pp_unit) and str(pp_unit).strip() != "":
+        try:
+            pp_unit_value = int(float(str(pp_unit).strip()))
+        except (TypeError, ValueError):
+            pp_unit_value = None
+    else:
+        pp_unit_value = None
     player_id = row.get("PlayerID") if isinstance(row, pd.Series) else None
 
     def _clean_float(val):
@@ -598,7 +605,7 @@ def normalize_lineup_player(
         "actual": _clean_float(actual),
         "ownership": _clean_float(ownership),
         "full": full if full not in (np.nan, "nan") else None,
-        "pp_unit": int(pp_unit) if pp_unit not in (None, np.nan, "") else None,
+        "pp_unit": pp_unit_value,
         "player_id": str(player_id) if player_id not in (None, np.nan, "") else None,
     }
 
