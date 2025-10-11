@@ -149,25 +149,71 @@ def _detect_slot_columns(df: pd.DataFrame) -> Dict[str, str]:
             return "D"
         return None
 
-    for col in df.columns:
+    slot_candidates: Dict[str, List[Tuple[int, str, int]]] = collections.defaultdict(list)
+
+    def _slot_score(col: str) -> int:
+        """Heuristic score favouring player-name columns over metadata."""
+
+        lower = str(col).lower()
+        score = 0
+        if any(token in lower for token in ["name", "player"]):
+            score += 10
+        if lower.strip() in {"c1", "c2", "w1", "w2", "w3", "d1", "d2", "g", "util"}:
+            score += 5
+        # Penalise obvious metadata/ID columns that share the same prefix.
+        if any(
+            token in lower
+            for token in [
+                "id",
+                "proj",
+                "projection",
+                "salary",
+                "own",
+                "fpts",
+                "points",
+                "exposure",
+                "count",
+                "weight",
+                "team",
+                "opp",
+                "stack",
+                "type",
+                "line",
+                "full",
+                "pp",
+                "slot",
+                "position",
+            ]
+        ):
+            score -= 8
+        return score
+
+    for order, col in enumerate(df.columns):
         slot = _slot_type(col)
         if not slot:
             continue
-        slot_counts[slot] += 1
-        idx = slot_counts[slot]
-        if slot == "C":
-            canon = f"C{idx}"
-        elif slot == "W":
-            canon = f"W{idx}"
-        elif slot == "D":
-            canon = f"D{idx}"
-        elif slot == "UTIL":
-            canon = "UTIL" if "UTIL" not in mapping.values() else f"UTIL{idx}"
-        else:
-            canon = "G"
-        if canon in mapping:
-            continue
-        mapping[canon] = col
+        score = _slot_score(col)
+        slot_candidates[slot].append((order, col, score))
+
+    for slot, candidates in slot_candidates.items():
+        # Sort by our heuristic (higher score wins) while keeping the original order
+        # for stability when scores tie.
+        ranked = sorted(candidates, key=lambda tup: (-tup[2], tup[0]))
+        slot_counts[slot] = len(ranked)
+        for idx, (_, col, _) in enumerate(ranked, start=1):
+            if slot == "C":
+                canon = f"C{idx}"
+            elif slot == "W":
+                canon = f"W{idx}"
+            elif slot == "D":
+                canon = f"D{idx}"
+            elif slot == "UTIL":
+                canon = "UTIL" if "UTIL" not in mapping else f"UTIL{idx}"
+            else:
+                canon = "G"
+            if canon in mapping:
+                continue
+            mapping[canon] = col
 
     required = {"C1", "C2", "W1", "W2", "W3", "D1", "D2", "G"}
     missing = sorted(required - set(mapping))
