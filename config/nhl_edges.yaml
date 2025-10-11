@@ -1,0 +1,49 @@
+salary:
+  min_spend: 49500
+  max_leftover: 500
+
+goalie_rules:
+  forbid_opp_skaters: true
+
+bringbacks:
+  enabled: false
+  max_from_opponent: 0
+
+stacks:
+  preferred_team_shapes:
+    - [4, 3, 1]
+    - [3, 3, 1, 1]
+  primary_evline:
+    min_size: 3
+    max_size: 4
+    required: true
+  secondary_pp1:
+    min_size: 2
+    max_size: 3
+    prefer_full_unit: false
+  pp1_full_unit:
+    enabled: false
+    min_size: 4
+    max_size: 5
+
+diversity:
+  require_unique_lineups: true
+  max_duplication_per_contest: 3
+  tie_break_random_pct: 0.10
+
+ownership:
+  enable: false
+  file: ""
+  column: "proj_own"
+  max_sum: 125.0
+  max_hhi: 0.12
+
+projection_guards:
+  max_proj_gap_to_pool_max: 8.0
+
+export:
+  dk_upload:
+    enable: true
+    use_player_ids: true
+    player_ids_path: "dk_data/player_ids.csv"
+
