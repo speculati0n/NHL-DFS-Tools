@@ -18,6 +18,7 @@ def main():
     ap.add_argument("--strict", action="store_true", help="Fail if any player lacks an ID")
     args = ap.parse_args()
 
+
     dk_export.export(args.lineups, args.player_ids, args.out, strict=args.strict)
     print(f"[NHL][Export] wrote {args.out}")
 
