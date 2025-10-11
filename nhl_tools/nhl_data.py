@@ -517,6 +517,83 @@ def load_player_reference(path: str) -> pd.DataFrame:
     return out
 
 
+def filter_by_slate_date(
+    df: pd.DataFrame, date_col_candidates: Tuple[str, ...] = ("date", "Date"), ymd: Optional[str] = None
+) -> pd.DataFrame:
+    """Filter a player reference frame to a single slate date if available."""
+
+    if df.empty or not ymd:
+        return df
+
+    date_col = _pick(df, *date_col_candidates)
+    if not date_col:
+        LOG.warning("Player reference missing date column; unable to filter for %s", ymd)
+        return df
+
+    dates = pd.to_datetime(df[date_col], errors="coerce")
+    if dates.isna().all():
+        LOG.warning("Unable to parse %s values in %s for date filtering", date_col, ymd)
+        return df
+
+    mask = dates.dt.strftime("%Y-%m-%d") == ymd
+    if not mask.any():
+        LOG.warning("No player reference rows matched slate date %s; leaving unfiltered", ymd)
+        return df
+    return df.loc[mask].copy()
+
+
+def _dedupe_player_reference(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    work = df.copy()
+    date_col = _pick(work, "date", "Date")
+    if date_col:
+        work["__sort_date__"] = pd.to_datetime(work[date_col], errors="coerce")
+    else:
+        work["__sort_date__"] = pd.NaT
+
+    work["__sort_proj__"] = pd.to_numeric(work.get("Proj"), errors="coerce").fillna(-np.inf)
+    work["__sort_idx__"] = np.arange(len(work))
+
+    work = work.sort_values(
+        by=["__sort_proj__", "__sort_date__", "__sort_idx__"], ascending=[False, False, False]
+    )
+
+    deduped = work.drop_duplicates(subset=["Name", "Team", "Pos"], keep="first")
+    return deduped.drop(columns=["__sort_proj__", "__sort_date__", "__sort_idx__"], errors="ignore")
+
+
+def load_player_reference_for_date(path: str, ymd: Optional[str]) -> pd.DataFrame:
+    """Load player reference data and optionally filter/deduplicate by slate date."""
+
+    df = load_player_reference(path)
+    if df.empty:
+        return df
+
+    date_col = _pick(df, "date", "Date")
+    slate_date = ymd
+    if not slate_date and date_col:
+        parsed_dates = pd.to_datetime(df[date_col], errors="coerce")
+        unique_dates = sorted({d.strftime("%Y-%m-%d") for d in parsed_dates.dropna()})
+        if len(unique_dates) == 1:
+            slate_date = unique_dates[0]
+            LOG.info("Detected single slate date %s in player reference; applying filter", slate_date)
+        elif len(unique_dates) > 1:
+            LOG.warning(
+                "Multiple slate dates detected in player reference (%s); "
+                "specify --date to filter",
+                ", ".join(unique_dates[:5]) + (", ..." if len(unique_dates) > 5 else ""),
+            )
+
+    filtered = filter_by_slate_date(df, ymd=slate_date)
+    if slate_date and filtered.empty():
+        LOG.warning("Falling back to unfiltered player reference due to empty result for %s", slate_date)
+        filtered = df
+
+    return _dedupe_player_reference(filtered)
+
+
 def _meta_pick(meta: Dict[str, object], *keys: str):
     for key in keys:
         if key in meta and not pd.isna(meta[key]):
@@ -542,12 +619,36 @@ def normalize_lineup_player(
     meta_own = _coerce_num(_meta_pick(meta_lower, "ownership", "own", "proj own", "own%"))
 
     candidates = player_lookup.get(norm_name, [])
-    best_row: Optional[pd.Series] = None
-    best_score = -1
     team_upper = str(meta_team).upper().strip() if meta_team else ""
     pos_upper = normalize_position(meta_pos)
 
-    for row in candidates:
+    def _prefer(pool: List[pd.Series], predicate) -> List[pd.Series]:
+        if not pool:
+            return pool
+        matches = [row for row in pool if predicate(row)]
+        return matches if matches else pool
+
+    narrowed = candidates
+    if team_upper:
+        narrowed = _prefer(
+            narrowed,
+            lambda row: str(row.get("Team", "")).upper().strip() == team_upper,
+        )
+    if pos_upper:
+        narrowed = _prefer(narrowed, lambda row: normalize_position(row.get("Pos")) == pos_upper)
+
+    def _has_line_info(row: pd.Series) -> bool:
+        full_val = row.get("Full")
+        has_full = pd.notna(full_val) and str(full_val).strip() not in {"", "nan", "None"}
+        return has_full or pd.notna(row.get("pp_unit"))
+
+    narrowed = _prefer(narrowed, _has_line_info)
+
+    pool = narrowed if narrowed else candidates
+
+    best_row: Optional[pd.Series] = None
+    best_score = -1
+    for row in pool:
         score = 0
         row_team = str(row.get("Team", "")).upper().strip()
         row_pos = normalize_position(row.get("Pos"))
@@ -558,6 +659,8 @@ def normalize_lineup_player(
         salary = row.get("Salary")
         if meta_salary is not None and pd.notna(salary) and abs(float(salary) - meta_salary) <= 100:
             score += 1
+        if _has_line_info(row):
+            score += 0.5
         if score > best_score:
             best_score = score
             best_row = row
