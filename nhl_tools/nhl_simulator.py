@@ -32,6 +32,8 @@ class PlayerRecord:
     pp_unit: Optional[int]   # 1/2 for PP1/PP2
     ownership: Optional[float] = None
     actual: Optional[float] = None
+    canonical_name: Optional[str] = None
+    player_id: Optional[str] = None
 
 
 @dataclass(init=False)
@@ -130,6 +132,28 @@ def _extract_slot_value(row: pd.Series, col: str) -> str:
     if isinstance(v, str) and "(" in v and v.endswith(")"):
         return v[: v.rfind("(")].strip()
     return v
+
+
+# ----------------------- Player helpers ----------------------
+def _player_key(player: PlayerRecord) -> str:
+    """Normalized key for aggregating players across outputs."""
+
+    source = player.canonical_name or player.name
+    return normalize_name(source)
+
+
+def _format_player_name(name: Optional[str], player_id: Optional[str]) -> str:
+    if not name:
+        return ""
+    if player_id:
+        return f"{name} ({player_id})"
+    return name
+
+
+def _format_player_cell(player: PlayerRecord) -> str:
+    display = player.canonical_name or player.name
+    pid = player.player_id if player.player_id else None
+    return _format_player_name(display, pid)
 
 
 # ----------------------- Metric builders ---------------------
@@ -319,6 +343,8 @@ def _build_lineups(lineups_df: pd.DataFrame,
                     ceiling=float(ceil_val) if ceil_val not in (None, "") else 0.0,
                     full=None,
                     pp_unit=None,
+                    canonical_name=name,
+                    player_id=None,
                 )
                 continue
 
@@ -331,11 +357,24 @@ def _build_lineups(lineups_df: pd.DataFrame,
             full = ref.get("Full", None)
             pp = ref.get("PP", None)
             pp = int(pp) if not pd.isna(pp) else None
+            canon_name = ref.get("Name", ref.get("Player", name))
+            if pd.isna(canon_name):
+                canon_name = name
+            canon_name = str(canon_name).strip()
+            player_id = ref.get("PlayerID", None)
+            if pd.isna(player_id):
+                player_id = None
+            elif isinstance(player_id, float) and player_id.is_integer():
+                player_id = str(int(player_id))
+            else:
+                player_id = str(player_id).strip()
+                if not player_id:
+                    player_id = None
 
             slots[canonical_slot] = PlayerRecord(
                 name=name, position=str(pos), team=str(team), opp=str(opp) if opp is not None else None,
                 salary=salary, projection=proj, ceiling=ceil, full=str(full) if full not in (None, "", np.nan) else None,
-                pp_unit=pp
+                pp_unit=pp, canonical_name=canon_name, player_id=player_id
             )
 
         lineup_id = row.get("Lineup") if isinstance(row, pd.Series) else None
@@ -459,7 +498,7 @@ def _simulate_field(
 
             # player sim ownership accounting
             for p in lu.players():
-                key = normalize_name(p.name)
+                key = _player_key(p)
                 player_counts[key] = player_counts.get(key, 0) + cnt
                 if key not in player_wins:
                     player_wins[key] = 0
@@ -476,7 +515,8 @@ def _simulate_field(
         if best_scores[winner_idx] > -np.inf:
             lineup_wins[winner_idx] += 1
             for p in lineups[winner_idx].players():
-                player_wins[normalize_name(p.name)] = player_wins.get(normalize_name(p.name), 0) + 1
+                key = _player_key(p)
+                player_wins[key] = player_wins.get(key, 0) + 1
 
     return SimulationResults(
         lineup_wins=lineup_wins,
@@ -520,7 +560,7 @@ def _lineups_table(
         row = {slot: "" for slot in DK_SLOTS}
         for s in DK_SLOTS:
             if s in lu.slots:
-                row[s] = lu.slots[s].name
+                row[s] = _format_player_cell(lu.slots[s])
 
         row.update({
             "Lineup": lu.id,
@@ -571,20 +611,37 @@ def _player_exposure_table(
     counts: Dict[str, int] = sim.player_counts
     wins: Dict[str, int] = sim.player_wins
 
-    # build roster-level meta to get Position/Team
-    meta: Dict[str, Tuple[str, str]] = {}
+    # build roster-level meta to get Position/Team plus display info
+    meta: Dict[str, Dict[str, Optional[str]]] = {}
     for lu in lineups:
         for p in lu.players():
-            key = normalize_name(p.name)
-            if key not in meta:
-                meta[key] = (p.position, p.team)
+            key = _player_key(p)
+            info = meta.get(key)
+            record = {
+                "position": p.position,
+                "team": p.team,
+                "name": p.canonical_name or p.name,
+                "player_id": p.player_id,
+            }
+            if info is None:
+                meta[key] = record
+            else:
+                # retain first seen position/team but prefer records with IDs for naming
+                if not info.get("player_id") and record.get("player_id"):
+                    info.update({
+                        "name": record.get("name"),
+                        "player_id": record.get("player_id"),
+                    })
 
     rows = []
     for key, cnt in counts.items():
         win = wins.get(key, 0)
-        pos, team = meta.get(key, ("", ""))
+        info = meta.get(key, {})
+        pos = info.get("position", "")
+        team = info.get("team", "")
+        label = _format_player_name(info.get("name"), info.get("player_id")) or key
         rows.append({
-            "Player": key,  # normalized name
+            "Player": label,
             "Position": pos,
             "Team": team,
             "Win%": 100.0 * win / denom_iters,
