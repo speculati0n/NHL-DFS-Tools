@@ -1,9 +1,13 @@
+import math
+
 import numpy as np
+import pandas as pd
 
 from nhl_tools.nhl_simulator import (
     DK_SLOTS,
     Lineup,
     PlayerRecord,
+    _build_lineups,
     _prepare_sim,
     _run_simulation,
 )
@@ -99,3 +103,76 @@ def test_simulation_handles_missing_ownership():
     player_table = results.player_table
     assert "Proj. Own%" in player_table.columns
     assert player_table["Proj. Own%"].isna().all()
+
+
+def test_build_lineups_extracts_slot_metadata_and_scores():
+    df = pd.DataFrame(
+        {
+            "LineupID": [1],
+            "C1 Name": ["Alpha"],
+            "C1 Team": ["AAA"],
+            "C1 Pos": ["C"],
+            "C1 Salary": [5200],
+            "C1 Proj": ["9.5"],
+            "C2 Name": ["Bravo"],
+            "C2 Team": ["AAA"],
+            "C2 Pos": ["C"],
+            "C2 Salary": [5100],
+            "C2 Proj": ["9.0"],
+            "W1 Name": ["Charlie"],
+            "W1 Team": ["AAA"],
+            "W1 Pos": ["W"],
+            "W1 Salary": [4900],
+            "W1 Proj": ["8.6"],
+            "W2 Name": ["Delta"],
+            "W2 Team": ["AAA"],
+            "W2 Pos": ["W"],
+            "W2 Salary": [4700],
+            "W2 Proj": ["8.2"],
+            "W3 Name": ["Echo"],
+            "W3 Team": ["AAA"],
+            "W3 Pos": ["W"],
+            "W3 Salary": [4500],
+            "W3 Proj": ["7.5"],
+            "D1 Name": ["Foxtrot"],
+            "D1 Team": ["AAA"],
+            "D1 Pos": ["D"],
+            "D1 Salary": [4400],
+            "D1 Proj": ["7.2"],
+            "D2 Name": ["Golf"],
+            "D2 Team": ["AAA"],
+            "D2 Pos": ["D"],
+            "D2 Salary": [4300],
+            "D2 Proj": ["6.9"],
+            "G Name": ["Hotel"],
+            "G Team": ["BBB"],
+            "G Pos": ["G"],
+            "G Salary": [7800],
+            "G Proj": ["8.0"],
+            "UTIL Name": ["India"],
+            "UTIL Team": ["AAA"],
+            "UTIL Pos": ["W"],
+            "UTIL Salary": [3600],
+            "UTIL Proj": ["5.1"],
+            "UTIL2 Name": ["Juliet"],
+            "UTIL2 Team": ["AAA"],
+            "UTIL2 Pos": ["C"],
+            "UTIL2 Salary": [3500],
+            "UTIL2 Proj": ["4.9"],
+        }
+    )
+
+    lineups, _ = _build_lineups(df, {}, None, quiet=True)
+    assert len(lineups) == 1
+    lineup = lineups[0]
+
+    _prepare_sim(lineups, cfg={})
+
+    expected_salary = 5200 + 5100 + 4900 + 4700 + 4500 + 4400 + 4300 + 7800 + 3600 + 3500
+    expected_projection = sum(
+        [9.5, 9.0, 8.6, 8.2, 7.5, 7.2, 6.9, 8.0, 5.1, 4.9]
+    )
+
+    assert math.isclose(lineup.metrics["salary"], expected_salary)
+    assert math.isclose(lineup.metrics["projection"], expected_projection)
+    assert math.isfinite(lineup.base_score)
