@@ -31,7 +31,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--date",
-        help="Slate date (YYYY-MM-DD) to filter player reference data",
+        help="Slate date YYYY-MM-DD for filtering player reference rows",
+        default=None,
     )
     parser.add_argument("--seed", type=int, help="Random seed for reproducibility")
     parser.add_argument(

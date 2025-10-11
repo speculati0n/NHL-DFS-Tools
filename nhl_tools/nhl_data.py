@@ -17,14 +17,23 @@ LOG = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def _pick(df: pd.DataFrame, *cands) -> Optional[str]:
-    """Robust column picker (FantasyLabs headers drift)."""
-    low = {c.lower(): c for c in df.columns}
-    for c in cands:
-        k = c.lower()
-        if k in low:
-            return low[k]
+def _pick(df: pd.DataFrame, *candidates: str) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    lowered = {c.lower(): c for c in df.columns}
+    for c in candidates:
+        key = c.lower()
+        if key in lowered:
+            return lowered[key]
     return None
+
+
+def _norm_date_str(x: str) -> str:
+    s = str(x).strip()
+    if len(s) == 8 and s.isdigit():
+        return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
+    return s[:10]
 
 
 def _coerce_num(s):
@@ -517,6 +526,32 @@ def load_player_reference(path: str) -> pd.DataFrame:
     return out
 
 
+def load_player_reference_for_date(path: str, ymd: Optional[str]) -> pd.DataFrame:
+    df = load_player_reference(path)
+    if ymd:
+        date_col = _pick(df, "date", "Date", "ymd", "YMD")
+        if date_col:
+            df = df.copy()
+            df["_ymd_norm"] = df[date_col].map(_norm_date_str)
+            df = df[df["_ymd_norm"] == ymd].drop(columns=["_ymd_norm"])
+    nm = _pick(df, "Name", "Player")
+    tm = _pick(df, "Team", "TeamAbbrev", "team")
+    pm = _pick(df, "Pos", "Position", "position")
+    if nm and tm and pm:
+        full_col = _pick(df, "Full")
+        pp_col = _pick(df, "PP")
+        df = df.copy()
+        df["has_fullpp"] = df[full_col].notna().astype(int) if full_col else 0
+        if pp_col:
+            df["has_fullpp"] += df[pp_col].notna().astype(int)
+        df = (
+            df.sort_values(["has_fullpp", "Proj"], ascending=[False, False])
+              .drop_duplicates(subset=[nm, tm, pm], keep="first")
+              .drop(columns=["has_fullpp"], errors="ignore")
+        )
+    return df
+
+
 def filter_by_slate_date(
     df: pd.DataFrame, date_col_candidates: Tuple[str, ...] = ("date", "Date"), ymd: Optional[str] = None
 ) -> pd.DataFrame:
@@ -562,36 +597,6 @@ def _dedupe_player_reference(df: pd.DataFrame) -> pd.DataFrame:
 
     deduped = work.drop_duplicates(subset=["Name", "Team", "Pos"], keep="first")
     return deduped.drop(columns=["__sort_proj__", "__sort_date__", "__sort_idx__"], errors="ignore")
-
-
-def load_player_reference_for_date(path: str, ymd: Optional[str]) -> pd.DataFrame:
-    """Load player reference data and optionally filter/deduplicate by slate date."""
-
-    df = load_player_reference(path)
-    if df.empty:
-        return df
-
-    date_col = _pick(df, "date", "Date")
-    slate_date = ymd
-    if not slate_date and date_col:
-        parsed_dates = pd.to_datetime(df[date_col], errors="coerce")
-        unique_dates = sorted({d.strftime("%Y-%m-%d") for d in parsed_dates.dropna()})
-        if len(unique_dates) == 1:
-            slate_date = unique_dates[0]
-            LOG.info("Detected single slate date %s in player reference; applying filter", slate_date)
-        elif len(unique_dates) > 1:
-            LOG.warning(
-                "Multiple slate dates detected in player reference (%s); "
-                "specify --date to filter",
-                ", ".join(unique_dates[:5]) + (", ..." if len(unique_dates) > 5 else ""),
-            )
-
-    filtered = filter_by_slate_date(df, ymd=slate_date)
-    if slate_date and filtered.empty():
-        LOG.warning("Falling back to unfiltered player reference due to empty result for %s", slate_date)
-        filtered = df
-
-    return _dedupe_player_reference(filtered)
 
 
 def _meta_pick(meta: Dict[str, object], *keys: str):
