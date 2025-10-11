@@ -17,7 +17,7 @@ import pandas as pd
 from nhl_tools.nhl_data import (
     DK_SALARY_CAP,
     apply_external_ownership,
-    load_player_reference,
+    load_player_reference_for_date,
     normalize_lineup_player,
     normalize_name,
 )
@@ -86,6 +86,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ownership-file",
         help="Optional ownership CSV to merge with players",
+    )
+    parser.add_argument(
+        "--date",
+        help="Slate date (YYYY-MM-DD) used to filter player reference data",
     )
     parser.add_argument("--seed", type=int, help="Random seed for reproducibility")
     parser.add_argument(
@@ -501,8 +505,6 @@ def _run_simulation(
         weights = np.ones_like(weights)
     probs = weights / weights.sum()
 
-    base_scores = np.array([lineup.base_score for lineup in lineups], dtype=float)
-
     lineup_counts = np.zeros(n, dtype=np.int64)
     lineup_duplicate_counts = np.zeros(n, dtype=np.float64)
     lineup_wins = np.zeros(n, dtype=np.int64)
@@ -521,11 +523,14 @@ def _run_simulation(
     for _ in range(iterations):
         counts = rng.multinomial(field_size, probs)
         noise = rng.normal(0.0, DEFAULT_NOISE, size=field_size)
+
         best_scores = np.full(n, -np.inf, dtype=float)
         idx_ptr = 0
+
         for lineup_idx, count in enumerate(counts):
             if count == 0:
                 continue
+
             lineup = lineups[lineup_idx]
             lineup_counts[lineup_idx] += count
             lineup_duplicate_counts[lineup_idx] += max(0, count - 1)
@@ -540,13 +545,18 @@ def _run_simulation(
             shape = lineup.metrics.get("lineup_shape", "")
             if shape:
                 shape_counts[shape] += stack_weight
-            conflict_key = "Has Conflict" if lineup.metrics.get("goalie_conflict", 0.0) else "No Conflict"
-            goalie_conflict_counts[conflict_key] += stack_weight
+            if lineup.metrics.get("goalie_conflict", 0.0) > 0.0:
+                goalie_conflict_counts["has_conflict"] += stack_weight
+            else:
+                goalie_conflict_counts["no_conflict"] += stack_weight
 
-            slice_noise = noise[idx_ptr : idx_ptr + count]
+            entry_noise = noise[idx_ptr : idx_ptr + count]
             idx_ptr += count
-            top_score = lineup.base_score + (slice_noise.max() if len(slice_noise) else 0.0)
-            best_scores[lineup_idx] = top_score
+            if entry_noise.size:
+                entry_scores = lineup.base_score + entry_noise
+                max_entry = float(np.max(entry_scores))
+                if max_entry > best_scores[lineup_idx]:
+                    best_scores[lineup_idx] = max_entry
 
             for player in lineup.players():
                 key = normalize_name(player.name)
@@ -692,11 +702,15 @@ def _run_simulation(
             )
     if goalie_conflict_counts:
         for descriptor, count in sorted(goalie_conflict_counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            pretty = {
+                "has_conflict": "Has Conflict",
+                "no_conflict": "No Conflict",
+            }.get(descriptor, descriptor)
             stack_rows.append(
                 {
                     "Category": "Skaters vs Goalie",
                     "Team": "",
-                    "Descriptor": descriptor,
+                    "Descriptor": pretty,
                     "Size": np.nan,
                     "Sim%": count / total_entries * 100.0 if total_entries else 0.0,
                 }
@@ -752,7 +766,7 @@ def main(args: argparse.Namespace | Sequence[str] | None = None) -> None:
     player_lookup: Dict[str, List[pd.Series]] = {}
     ownership_df: Optional[pd.DataFrame] = None
     if ns.players:
-        players_df = load_player_reference(ns.players)
+        players_df = load_player_reference_for_date(ns.players, ns.date)
         if ns.ownership_file:
             players_df = apply_external_ownership(players_df, ns.ownership_file, None)
         player_lookup = collections.defaultdict(list)
