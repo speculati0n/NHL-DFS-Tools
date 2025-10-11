@@ -18,10 +18,6 @@ def main():
     ap.add_argument("--strict", action="store_true", help="Fail if any player lacks an ID")
     args = ap.parse_args()
 
-    if not os.path.exists(args.lineups):
-        ap.error(f"lineups file not found: {args.lineups}")
-    if not os.path.exists(args.player_ids):
-        ap.error(f"player ID sheet not found: {args.player_ids}")
 
     dk_export.export(args.lineups, args.player_ids, args.out, strict=args.strict)
     print(f"[NHL][Export] wrote {args.out}")
