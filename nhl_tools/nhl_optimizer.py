@@ -16,6 +16,8 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from nhl_tools.id_mapping import load_player_ids_any, find_pid  # NEW
+
 # ───────────────────────────────────────────────────────────────────────────────
 # CONFIG / CONSTANTS (DK NHL Classic)
 # ───────────────────────────────────────────────────────────────────────────────
@@ -61,6 +63,7 @@ def _safe_str(x) -> str:
     if isinstance(x, float) and np.isnan(x): return ""
     return str(x)
 
+
 def _norm_name(x) -> str:
     s = _safe_str(x)
     s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
@@ -69,28 +72,6 @@ def _norm_name(x) -> str:
     s = re.sub(r"\b(jr|sr|ii|iii|iv)\b\.?", "", s).strip()
     return s
 
-def _pid_key(name: Optional[str], team: Optional[str], pos: Optional[str]) -> str:
-    return f"{_norm_name(name)}|{_safe_str(team).strip().upper()}|{_safe_str(pos).strip().upper()}"
-
-def load_player_ids(path: str) -> Dict[str, str]:
-    mp: Dict[str, str] = {}
-    if not os.path.exists(path):
-        LOG.warning("player_ids.csv not found at %s — ID decoration will be empty.", path)
-        return mp
-    with open(path, newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            pid = _safe_str(row.get("player_id", "")).strip()
-            name = row.get("name", "")
-            team = row.get("team", "")
-            pos = row.get("pos", "")
-            if pid:
-                mp[_pid_key(name, team, pos)] = pid
-    return mp
-
-def decorate(name: str, team: str, pos: str, mp: Dict[str, str]) -> str:
-    pid = mp.get(_pid_key(name, team, pos), "")
-    return f"{_safe_str(name)} ({pid})"
 
 def _resolve_four_paths(labs_dir: str, date: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -104,6 +85,7 @@ def _resolve_four_paths(labs_dir: str, date: str) -> Dict[str, str]:
             raise FileNotFoundError(f"Missing Labs file for {p}. Tried {guess}")
         out[p] = sorted(g)[-1]
     return out
+
 
 def _read_labs_one(path: str, pos: str) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -139,6 +121,7 @@ def load_labs_merged(labs_dir: str, date: str) -> pd.DataFrame:
     full = full.drop_duplicates(subset=["name_key","pos"], keep="first").reset_index(drop=True)
     return full
 
+
 def apply_randomness(df: pd.DataFrame, randomness_by_pos: Dict[str,float] | None) -> pd.DataFrame:
     rbp = randomness_by_pos or DEFAULT_RANDOMNESS_BY_POS
     out = df.copy()
@@ -151,6 +134,7 @@ def apply_randomness(df: pd.DataFrame, randomness_by_pos: Dict[str,float] | None
         jittered.append(base[i] * (1.0 + eps))
     out["proj_points_rand"] = jittered
     return out
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # FEASIBILITY DIAGNOSTICS
@@ -174,6 +158,7 @@ def _approx_feasible_salary_range(pool: pd.DataFrame) -> tuple[int,int,bool,Dict
     feas_max += (sk["salary"].iloc[-1] if len(sk)>0 else 0)
     return feas_min, feas_max, ok, counts
 
+
 # ───────────────────────────────────────────────────────────────────────────────
 # SIMPLE GREEDY + SALARY STEERING
 # ───────────────────────────────────────────────────────────────────────────────
@@ -181,6 +166,7 @@ def _choose(pool, pos, chosen, remain_cap):
     cand = pool[(pool["pos"]==pos) & (~pool.index.isin(chosen)) & (pool["salary"]<=remain_cap)]
     if cand.empty: return None
     return int((cand["proj_points_rand"] + np.random.rand(len(cand))*1e-6).idxmax())
+
 
 def _try_salary_steer(pool, roster_idx: Dict[str,int], target_min: int, current_salary: int, cap: int):
     if current_salary >= target_min:
@@ -202,6 +188,7 @@ def _try_salary_steer(pool, roster_idx: Dict[str,int], target_min: int, current_
         if current_salary >= target_min:
             break
     return roster_idx, current_salary
+
 
 def build_lineups(pool: pd.DataFrame, num: int, min_salary: int, max_salary: int, attempts_multiplier: int = 600) -> List[Dict[str,int]]:
     lineups: List[Dict[str,int]] = []
@@ -254,16 +241,22 @@ def build_lineups(pool: pd.DataFrame, num: int, min_salary: int, max_salary: int
 
     return lineups
 
+
 # ───────────────────────────────────────────────────────────────────────────────
-# EXPORT / CLI
+# EXPORT / CLI (uses DK export-style player_ids.csv OR simple mapping)
 # ───────────────────────────────────────────────────────────────────────────────
-def export_lineups(pool: pd.DataFrame, lineups: List[Dict[str,int]], player_ids: Dict[str,str], out_path: str, raw_path: Optional[str]=None) -> None:
+def decorate(name: str, team: str, pos: str, pid_map: Dict[str,str]) -> str:
+    pid = find_pid(name, team, pos, pid_map)  # NEW: robust lookup with fallbacks
+    return f"{_safe_str(name)} ({pid})"
+
+
+def export_lineups(pool: pd.DataFrame, lineups: List[Dict[str,int]], pid_map: Dict[str,str], out_path: str, raw_path: Optional[str]=None) -> None:
     rows, rows_raw = [], []
     for r in lineups:
         def cell(idx: Optional[int]) -> str:
             if idx is None: return ""
             row = pool.loc[idx]
-            return decorate(row["name"], row.get("team",""), row.get("pos",""), player_ids)
+            return decorate(row["name"], row.get("team",""), row.get("pos",""), pid_map)
         row = {
             "C1": cell(r.get("C1")), "C2": cell(r.get("C2")),
             "W1": cell(r.get("W1")), "W2": cell(r.get("W2")), "W3": cell(r.get("W3")),
@@ -281,6 +274,7 @@ def export_lineups(pool: pd.DataFrame, lineups: List[Dict[str,int]], player_ids:
         pd.DataFrame(rows_raw).to_csv(raw_path, index=False)
     LOG.info("Wrote %s%s", out_path, f" and {raw_path}" if raw_path else "")
 
+
 def _load_config(path: Optional[str]) -> Dict:
     if not path:
         for c in ("config.json","sample.config.json"):
@@ -292,8 +286,9 @@ def _load_config(path: Optional[str]) -> Dict:
         with open(path,"r",encoding="utf-8") as f: return yaml.safe_load(f) or {}
     with open(path,"r",encoding="utf-8") as f: return json.load(f)
 
+
 def parse_args():
-    ap = argparse.ArgumentParser("NHL Optimizer (robust)")
+    ap = argparse.ArgumentParser("NHL Optimizer (DK player_ids support)")
     ap.add_argument("--date", required=True)
     ap.add_argument("--labs-dir", default="dk_data")
     ap.add_argument("--out", default="out/lineups_{date}.csv")
@@ -304,6 +299,7 @@ def parse_args():
     ap.add_argument("--config", type=str, default=None)
     ap.add_argument("--verbose", action="store_true")
     return ap.parse_args()
+
 
 def main():
     args = parse_args()
@@ -320,7 +316,7 @@ def main():
     rbp = cfg.get("randomness_pct_by_pos", DEFAULT_RANDOMNESS_BY_POS)
     df = apply_randomness(df, rbp)
 
-    # Feasibility check with clear logs
+    # Optional feasibility logs
     feas_min, feas_max, ok, counts = _approx_feasible_salary_range(df)
     LOG.info("Pool counts: %s", counts)
     LOG.info("Approx feasible salary range: min=%d, max=%d | requested [%d, %d]",
@@ -346,8 +342,11 @@ def main():
         LOG.error("No lineups produced — try --min-salary 45000 or set config.attempts_multiplier to 1200; also verify position counts.")
         sys.exit(2)
 
-    pid_map = load_player_ids(os.path.join("dk_data", "player_ids.csv"))
+    # 🔹 NEW: Load player IDs from DK export-style OR simple mapping
+    pid_map = load_player_ids_any(os.path.join("dk_data", "player_ids.csv"))
+
     export_lineups(df, lineups, pid_map, out_path, raw_path=raw_path)
+
 
 if __name__ == "__main__":
     main()
