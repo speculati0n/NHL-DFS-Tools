@@ -1,590 +1,430 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""DraftKings NHL GPP simulator with NFL-style interface and outputs."""
 from __future__ import annotations
 
 import argparse
-import collections
-import logging
 import math
 import os
-from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-from nhl_tools.nhl_data import (
-    DK_SALARY_CAP,
-    apply_external_ownership,
-    load_player_reference_for_date,
-    normalize_lineup_player,
+from .nhl_data import (
     normalize_name,
+    load_player_reference_for_date,
 )
-from nhl_tools.nhl_optimizer import _load_config
 
-LOG = logging.getLogger("nhl_sim")
-DEFAULT_NOISE = 0.75  # scoring jitter per entry to break ties
-
-# Canonical DraftKings slot order (used for output formatting)
+# --- Configuration defaults (can be exposed to YAML later) ---
+DEFAULT_NOISE = 5.0  # per-entry gaussian noise to create variance in the simulated field
 DK_SLOTS = ["C1", "C2", "W1", "W2", "W3", "D1", "D2", "G", "UTIL", "UTIL2"]
 
-
+# ----------------------- Data classes ------------------------
 @dataclass
 class PlayerRecord:
     name: str
     position: str
     team: str
-    opp: str | None = None
-    salary: float | None = None
-    projection: float | None = None
-    ceiling: float | None = None
-    actual: float | None = None
-    ownership: float | None = None
-    full: str | None = None
-    pp_unit: Optional[int] = None
-    player_id: str | None = None
-
-    @property
-    def is_skater(self) -> bool:
-        return self.position not in {"G", "GOALIE"}
-
-    @property
-    def is_goalie(self) -> bool:
-        return self.position in {"G", "GOALIE"}
+    opp: Optional[str]
+    salary: float
+    projection: float
+    ceiling: float
+    full: Optional[str]      # EV line tag e.g. 1F/2F/3F/1D/2D
+    pp_unit: Optional[int]   # 1/2 for PP1/PP2
+    ownership: Optional[float] = None
+    actual: Optional[float] = None
 
 
-@dataclass
+@dataclass(init=False)
 class Lineup:
-    idx: int
-    lineup_id: str
-    slot_players: Dict[str, PlayerRecord]
-    signature: str
-    metrics: Dict[str, float]
-    base_score: float
-    stack_tags: Dict[str, str] = field(default_factory=dict)
+    id: int
+    slots: Dict[str, PlayerRecord]
+    base_score: float = 0.0
+    metrics: Dict[str, float] = None  # computed props (salary, clusters, conflicts, etc.)
+    signature: Optional[str] = None
+    idx: Optional[int] = None
 
-    def players(self) -> Iterable[PlayerRecord]:
-        return self.slot_players.values()
+    def __init__(
+        self,
+        id: Optional[int] = None,
+        slots: Optional[Dict[str, PlayerRecord]] = None,
+        *,
+        idx: Optional[int] = None,
+        lineup_id: Optional[str] = None,
+        slot_players: Optional[Dict[str, PlayerRecord]] = None,
+        signature: Optional[str] = None,
+        metrics: Optional[Dict[str, float]] = None,
+        base_score: float = 0.0,
+    ) -> None:
+        if slots is None and slot_players is not None:
+            slots = slot_players
+        if slots is None:
+            slots = {}
+        if id is None and lineup_id is not None:
+            try:
+                id = int(lineup_id)
+            except Exception:
+                id = lineup_id
+        if isinstance(id, (int, np.integer)):
+            self.id = int(id)
+        elif isinstance(id, str):
+            try:
+                self.id = int(id)
+            except ValueError:
+                self.id = id
+        elif id is None:
+            self.id = 0
+        else:
+            self.id = id
+        self.slots = slots
+        self.base_score = float(base_score)
+        self.metrics = metrics
+        self.signature = signature
+        self.idx = idx
+        self.lineup_id = lineup_id if lineup_id is not None else self.id
 
-
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
-
-
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Edges-aware NHL GPP simulator")
-    parser.add_argument("--site", default="DK", help="Site (DraftKings supported)")
-    parser.add_argument("--field-size", type=int, default=20000, help="Contest field size")
-    parser.add_argument("--iterations", type=int, default=5000, help="Simulation iterations")
-    parser.add_argument("--lineups", required=True, help="CSV of generated lineups")
-    parser.add_argument(
-        "--players",
-        help="Optional player pool CSV (FantasyLabs export / optimizer pool)",
-    )
-    parser.add_argument(
-        "--ownership-file",
-        help="Optional ownership CSV to merge with players",
-    )
-    parser.add_argument(
-        "--date",
-        help="Slate date (YYYY-MM-DD) used to filter player reference data",
-    )
-    parser.add_argument("--seed", type=int, help="Random seed for reproducibility")
-    parser.add_argument(
-        "--outdir",
-        default="output",
-        help="Output directory for simulator CSVs (default: output/)",
-    )
-    parser.add_argument(
-        "--config",
-        default="config/nhl_edges.yaml",
-        help="YAML config with stack / ownership tuning",
-    )
-    parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress informational logs",
-    )
-    return parser
+    def players(self) -> List[PlayerRecord]:
+        return [self.slots[s] for s in DK_SLOTS if s in self.slots]
 
 
-def _coerce_namespace(args: argparse.Namespace | Sequence[str] | None) -> argparse.Namespace:
-    if isinstance(args, argparse.Namespace):
-        return args
-    parser = _build_parser()
-    if args is None:
-        return parser.parse_args()
-    return parser.parse_args(args)
+# ----------------------- I/O helpers -------------------------
+def _detect_slot_columns(df: pd.DataFrame) -> List[str]:
+    chosen: Dict[str, Tuple[int, str]] = {}
+    for col in df.columns:
+        cu = str(col).upper().strip()
+        for slot in DK_SLOTS:
+            score = None
+            if cu == slot:
+                score = 3
+            elif cu.startswith(f"{slot} ") and ("NAME" in cu or "PLAYER" in cu):
+                score = 2
+            elif cu.startswith(slot):
+                score = 1
+            if score is not None:
+                if slot not in chosen or score > chosen[slot][0]:
+                    chosen[slot] = (score, col)
+    ordered = []
+    for slot in DK_SLOTS:
+        if slot in chosen:
+            ordered.append(chosen[slot][1])
+    return ordered
 
 
-# ---------------------------------------------------------------------------
-# Input handling
-# ---------------------------------------------------------------------------
-
-
-def _read_lineups_csv(path: str) -> pd.DataFrame:
+def _read_lineups(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
-    if df.empty:
-        raise ValueError("Lineup file is empty")
+    # allow either Lineup/LineupID column or create one
+    id_col = None
+    for cand in ("LineupID", "Lineup", "lineup_id", "lineup"):
+        if cand in df.columns:
+            id_col = cand
+            break
+    if id_col is None:
+        df["Lineup"] = np.arange(1, len(df) + 1)
+        id_col = "Lineup"
+    df.rename(columns={id_col: "Lineup"}, inplace=True)
     return df
 
 
-def _detect_slot_columns(df: pd.DataFrame) -> Dict[str, str]:
-    """Map dataframe columns to canonical DK slots."""
+def _extract_slot_value(row: pd.Series, col: str) -> str:
+    v = row.get(col, "")
+    # allow "Name (123456)" -> "Name"
+    if isinstance(v, str) and "(" in v and v.endswith(")"):
+        return v[: v.rfind("(")].strip()
+    return v
 
-    slot_counts = collections.Counter()
-    mapping: Dict[str, str] = {}
 
-    def _slot_type(col: str) -> Optional[str]:
-        base = "".join(ch for ch in str(col).upper() if ch.isalnum())
-        if not base:
+# ----------------------- Metric builders ---------------------
+def _group_counts(players: List[PlayerRecord], key_fn) -> Dict[Tuple, int]:
+    counts: Dict[Tuple, int] = {}
+    for p in players:
+        k = key_fn(p)
+        if k is None:
+            continue
+        counts[k] = counts.get(k, 0) + 1
+    return counts
+
+
+def _compute_lineup_metrics(lineup: Lineup) -> Dict[str, float]:
+    players = lineup.players()
+
+    # salary & projection/ceiling
+    salary = float(sum([p.salary or 0.0 for p in players]))
+    proj = float(sum([p.projection or 0.0 for p in players]))
+    ceil = float(sum([p.ceiling or 0.0 for p in players]))
+
+    # EV line clusters: same team + same 'full'
+    ev_counts = _group_counts(
+        players,
+        key_fn=lambda p: (p.team, p.full) if (p.team and p.full) else None,
+    )
+    ev_cluster = max(ev_counts.values()) if ev_counts else 0
+    ev_stacks = []
+    for (team, full), cnt in ev_counts.items():
+        if team and full and cnt >= 2:
+            ev_stacks.append((team, full, cnt))
+
+    # PP1 cluster: same team with pp_unit == 1
+    pp_counts = _group_counts(
+        [p for p in players if p.pp_unit == 1 and p.team],
+        key_fn=lambda p: (p.team,),
+    )
+    pp1_cluster = max(pp_counts.values()) if pp_counts else 0
+    pp1_stacks = []
+    for (team,), cnt in pp_counts.items():
+        if team and cnt >= 2:
+            pp1_stacks.append((team, cnt))
+
+    # goalie vs skaters conflicts
+    goalie_teams = set([p.team for p in players if p.position == "G" and p.team])
+    conflicts = 0
+    for p in players:
+        if p.position != "G" and p.opp and p.opp in goalie_teams:
+            conflicts += 1
+
+    # bring-backs: skaters from primary opponent of the largest stack team
+    primary_team = None
+    if ev_stacks:
+        primary_team = sorted(ev_stacks, key=lambda t: t[2], reverse=True)[0][0]
+    elif pp1_stacks:
+        primary_team = sorted(pp1_stacks, key=lambda t: t[1], reverse=True)[0][0]
+    bringbacks = 0
+    if primary_team:
+        opps = set([p.opp for p in players if p.team == primary_team and p.opp])
+        if len(opps) == 1:
+            primary_opp = list(opps)[0]
+            bringbacks = sum(1 for p in players if p.team == primary_opp)
+
+    # lineup shape (team counts)
+    team_counts = {}
+    for p in players:
+        if p.team:
+            team_counts[p.team] = team_counts.get(p.team, 0) + 1
+    shape = "-".join(str(c) for c in sorted(team_counts.values(), reverse=True))
+
+    return {
+        "salary": salary,
+        "projection": proj,
+        "ceiling": ceil,
+        "ev_cluster": ev_cluster,
+        "pp1_cluster": pp1_cluster,
+        "ev_stacks": ev_stacks,
+        "pp1_stacks": pp1_stacks,
+        "goalie_conflict": conflicts,
+        "bringbacks": bringbacks,
+        "lineup_shape": shape,
+    }
+
+
+def _adjusted_score(lineup: Lineup) -> float:
+    """Base score used for field sampling: projection plus NHL edges."""
+    m = lineup.metrics
+    score = m.get("projection", 0.0)
+    # correlation boosts
+    score += 0.5 * max(0, m.get("ev_cluster", 0) - 2)     # reward 3–4 EV
+    score += 0.4 * max(0, m.get("pp1_cluster", 0) - 2)    # reward 3–5 PP1
+    # negative correlations
+    score -= 3.0 * m.get("goalie_conflict", 0)
+    score -= 1.0 * min(2, m.get("bringbacks", 0))
+    # near-cap preference
+    salary_left = max(0.0, 50000.0 - m.get("salary", 0.0))
+    score -= 0.1 * max(0.0, salary_left - 500) / 100.0
+    return float(score)
+
+
+# ----------------------- Build lineups -----------------------
+def _build_lineups(lineups_df: pd.DataFrame,
+                   ref_df: pd.DataFrame,
+                   *_unused_args,
+                   **_unused_kwargs) -> List[Lineup]:
+    if not isinstance(ref_df, pd.DataFrame):
+        ref_df = pd.DataFrame(ref_df)
+    slot_cols = _detect_slot_columns(lineups_df)
+    if len(slot_cols) < 8:
+        raise ValueError(f"Could not detect DK slots in lineups file; found: {slot_cols}")
+
+    # index player reference by normalized name (keep multiple rows under same key)
+    nm = "Player" if "Player" in ref_df.columns else "Name"
+    name_groups: Dict[str, List[dict]] = {}
+    for _, r in ref_df.iterrows():
+        key = normalize_name(str(r[nm]))
+        name_groups.setdefault(key, []).append(r)
+
+    # helper to choose best ref row for lineup slot
+    def choose_ref(name: str, slot_pos: str) -> Optional[dict]:
+        key = normalize_name(name)
+        cands = name_groups.get(key, [])
+        if not cands:
             return None
-        if base.startswith("UTIL"):
-            return "UTIL"
-        if base.startswith("GOALIE") or base == "G" or base.startswith("G"):  # goalie
-            return "G"
-        if base.startswith("CENTER") or base.startswith("C"):
-            return "C"
-        if base.startswith("WING") or base.startswith("W"):
-            return "W"
-        if base.startswith("DEF") or base.startswith("D"):
-            return "D"
-        return None
-
-    slot_candidates: Dict[str, List[Tuple[int, str, int]]] = collections.defaultdict(list)
-
-    def _slot_score(col: str) -> int:
-        """Heuristic score favouring player-name columns over metadata."""
-
-        lower = str(col).lower()
-        score = 0
-        if any(token in lower for token in ["name", "player"]):
-            score += 10
-        if lower.strip() in {"c1", "c2", "w1", "w2", "w3", "d1", "d2", "g", "util"}:
-            score += 5
-        # Penalise obvious metadata/ID columns that share the same prefix.
-        if any(
-            token in lower
-            for token in [
-                "id",
-                "proj",
-                "projection",
-                "salary",
-                "own",
-                "fpts",
-                "points",
-                "exposure",
-                "count",
-                "weight",
-                "team",
-                "opp",
-                "stack",
-                "type",
-                "line",
-                "full",
-                "pp",
-                "slot",
-                "position",
-            ]
-        ):
-            score -= 8
-        return score
-
-    for order, col in enumerate(df.columns):
-        slot = _slot_type(col)
-        if not slot:
-            continue
-        score = _slot_score(col)
-        slot_candidates[slot].append((order, col, score))
-
-    for slot, candidates in slot_candidates.items():
-        # Sort by our heuristic (higher score wins) while keeping the original order
-        # for stability when scores tie.
-        ranked = sorted(candidates, key=lambda tup: (-tup[2], tup[0]))
-        slot_counts[slot] = len(ranked)
-        for idx, (_, col, _) in enumerate(ranked, start=1):
-            if slot == "C":
-                canon = f"C{idx}"
-            elif slot == "W":
-                canon = f"W{idx}"
-            elif slot == "D":
-                canon = f"D{idx}"
-            elif slot == "UTIL":
-                canon = "UTIL" if "UTIL" not in mapping else f"UTIL{idx}"
-            else:
-                canon = "G"
-            if canon in mapping:
-                continue
-            mapping[canon] = col
-
-    required = {"C1", "C2", "W1", "W2", "W3", "D1", "D2", "G"}
-    missing = sorted(required - set(mapping))
-    if missing:
-        raise ValueError(
-            "Lineup file missing required slots. Expected DraftKings columns "
-            f"covering {sorted(required)}; inferred mapping was {mapping}."
-        )
-    if "UTIL" not in mapping:
-        # allow single util slot but not fatal; create placeholder for order
-        mapping["UTIL"] = None
-    return mapping
-
-
-def _extract_slot_value(row: pd.Series, column: Optional[str]) -> Optional[str]:
-    if column is None:
-        return None
-    value = row.get(column)
-    if pd.isna(value):
-        return None
-    return str(value).strip()
-
-
-def _extract_slot_metadata(row: pd.Series, slot: str, column: Optional[str]) -> Dict[str, str]:
-    """Gather extra metadata columns that share the same prefix as the slot."""
-
-    if column is None and not slot:
-        return {}
-
-    prefixes = set()
-    if column is not None:
-        column_str = str(column).strip()
-        prefixes.add(column_str)
-        if " " in column_str:
-            prefixes.add(column_str.split(" ")[0])
-    if slot:
-        prefixes.add(str(slot).strip())
-
-    cleaned_prefixes = {p for p in prefixes if p}
-    if not cleaned_prefixes:
-        return {}
-
-    meta: Dict[str, str] = {}
-    for col, value in row.items():
-        if column is not None and col == column:
-            continue
-        if not isinstance(col, str):
-            continue
-        col_str = col.strip()
-        for prefix in cleaned_prefixes:
-            if not prefix:
-                continue
-            if col_str == prefix:
-                continue
-            # Allow separators commonly used in optimizer exports.
-            for separator in (" ", "_", "-", "::"):
-                token = prefix + separator
-                if col_str.startswith(token):
-                    key = col_str[len(token) :].strip().lower()
-                    if key:
-                        meta[key] = value
-                    break
-            else:
-                # Handle compact column names like C1Salary.
-                if col_str.lower().startswith(prefix.lower()) and len(col_str) > len(prefix):
-                    key = col_str[len(prefix) :].strip().lower()
-                    if key:
-                        meta[key] = value
-        # end prefix loop
-    return meta
-
-
-def _lineup_weights(df: pd.DataFrame) -> np.ndarray:
-    for cand in ["Weight", "Weights", "Exposure", "Exposure%", "Entries", "Count"]:
-        if cand in df.columns:
-            weights = pd.to_numeric(df[cand], errors="coerce").fillna(0).to_numpy()
-            if weights.sum() <= 0:
-                continue
-            if cand.lower().endswith("%") or weights.max() <= 1.0001:
-                weights = weights.astype(float)
-                if weights.max() > 1.0001:
-                    weights = weights / 100.0
-            return weights.astype(float)
-    return np.ones(len(df), dtype=float)
-
-
-def _build_lineups(
-    df: pd.DataFrame,
-    player_lookup: Dict[str, List[pd.Series]],
-    ownership_df: Optional[pd.DataFrame],
-    quiet: bool,
-) -> Tuple[List[Lineup], Dict[str, int]]:
-    mapping = _detect_slot_columns(df)
-    weights = _lineup_weights(df)
-
-    ownership_df = ownership_df.copy() if ownership_df is not None else None
-    if ownership_df is not None:
-        ownership_df["NameNorm"] = ownership_df["Name"].map(normalize_name)
-        ownership_df["Team"] = ownership_df["Team"].astype(str).str.upper().str.strip()
-        ownership_df["Pos"] = ownership_df["Pos"].astype(str).str.upper().str.strip()
+        # score by Team/Pos/Full/PP presence, tie-break by higher Proj
+        best = None
+        best_score = -1e9
+        for r in cands:
+            score = 0
+            poscol = "Pos" if "Pos" in r.index else "Position" if "Position" in r.index else None
+            teamcol = "Team" if "Team" in r.index else "TeamAbbrev" if "TeamAbbrev" in r.index else None
+            if poscol and str(r[poscol]).upper().startswith(slot_pos[:1]):
+                score += 2
+            if r.get("Full") not in (None, "", np.nan):
+                score += 2
+            if not pd.isna(r.get("PP", np.nan)):
+                score += 1
+            score += float(r.get("Proj", 0.0)) * 1e-6  # tiny nudge
+            if score > best_score:
+                best_score = score
+                best = r
+        return best
 
     lineups: List[Lineup] = []
-    dup_counter: Dict[str, int] = collections.Counter()
-
-    for idx, row in df.iterrows():
-        slot_players: Dict[str, PlayerRecord] = {}
-        identifiers: List[str] = []
-        for slot in DK_SLOTS:
-            source_col = mapping.get(slot)
-            value = _extract_slot_value(row, source_col)
-            if not value:
+    for i, row in lineups_df.iterrows():
+        slots: Dict[str, PlayerRecord] = {}
+        for col in slot_cols:
+            name = _extract_slot_value(row, col)
+            if not isinstance(name, str) or not name.strip():
                 continue
-            meta = _extract_slot_metadata(row, slot, source_col)
-            raw_player = normalize_lineup_player(value, meta, player_lookup)
-            player = PlayerRecord(**raw_player)
-            if ownership_df is not None and not player.ownership:
-                match = ownership_df[
-                    (ownership_df["NameNorm"] == normalize_name(player.name))
-                    & ((ownership_df["Team"] == player.team) | ownership_df["Team"].isna())
-                ]
-                if not match.empty:
-                    cand = match.iloc[0]
+            slot_pos = "G" if col.upper().startswith("G") else \
+                       "D" if col.upper().startswith("D") else \
+                       "C" if col.upper().startswith("C") else "W"
+            col_prefix = str(col).split()[0].upper()
+            cu = str(col).upper().strip()
+            canonical_slot = None
+            for slot in DK_SLOTS:
+                if cu == slot or cu.startswith(f"{slot} "):
+                    canonical_slot = slot
+                    break
+            if canonical_slot is None:
+                canonical_slot = str(col)
+
+            def _lookup(keyword: str) -> Optional[float | str]:
+                keyword_upper = keyword.upper()
+                for c in lineups_df.columns:
+                    cu = str(c).upper()
+                    if cu.startswith(col_prefix) and keyword_upper in cu and "NAME" not in cu:
+                        return row.get(c)
+                return None
+
+            ref = choose_ref(name, slot_pos)
+            if ref is None:
+                # minimal fallback player
+                salary_val = _lookup("SAL")
+                proj_val = _lookup("PROJ")
+                ceil_val = _lookup("CEIL")
+                team_val = _lookup("TEAM")
+                opp_val = _lookup("OPP")
+                slots[canonical_slot] = PlayerRecord(
+                    name=name,
+                    position=slot_pos,
+                    team=str(team_val).upper() if isinstance(team_val, str) else "",
+                    opp=str(opp_val).upper() if isinstance(opp_val, str) else None,
+                    salary=float(salary_val) if salary_val not in (None, "") else 0.0,
+                    projection=float(proj_val) if proj_val not in (None, "") else 0.0,
+                    ceiling=float(ceil_val) if ceil_val not in (None, "") else 0.0,
+                    full=None,
+                    pp_unit=None,
+                )
+                continue
+
+            pos = ref["Pos"] if "Pos" in ref else ref.get("Position", slot_pos)
+            team = ref["Team"] if "Team" in ref else ref.get("TeamAbbrev", "")
+            opp = ref.get("Opp") if "Opp" in ref else ref.get("Opponent", None)
+            salary = float(ref.get("Salary", 0) or 0)
+            proj = float(ref.get("Proj", 0) or 0)
+            ceil = float(ref.get("Ceiling", 0) or 0)
+            full = ref.get("Full", None)
+            pp = ref.get("PP", None)
+            pp = int(pp) if not pd.isna(pp) else None
+
+            slots[canonical_slot] = PlayerRecord(
+                name=name, position=str(pos), team=str(team), opp=str(opp) if opp is not None else None,
+                salary=salary, projection=proj, ceiling=ceil, full=str(full) if full not in (None, "", np.nan) else None,
+                pp_unit=pp
+            )
+
+        lineup_id = row.get("Lineup") if isinstance(row, pd.Series) else None
+        if lineup_id is None and isinstance(row, pd.Series):
+            lineup_id = row.get("LineupID")
+        if lineup_id is None:
+            lineup_id = i + 1
+        l = Lineup(id=lineup_id, slots=slots)
+        l.metrics = _compute_lineup_metrics(l)
+
+        # salary fallback if unresolved: pull from optimizer-exported total if present
+        if l.metrics.get("salary", 0.0) <= 0.0:
+            for opt_col in ("TotalSalary", "Total Salary", "SalarySum", "Salary"):
+                if opt_col in lineups_df.columns:
                     try:
-                        player.ownership = float(cand.get("Ownership"))
+                        l.metrics["salary"] = float(row[opt_col])
+                        break
                     except Exception:
-                        player.ownership = None
-            slot_players[slot] = player
-            identifier = player.player_id or f"{normalize_name(player.name)}:{player.team}:{player.position}"
-            identifiers.append(identifier)
+                        pass
 
-        if not slot_players:
-            continue
-        signature = "|".join(sorted(identifiers))
-        dup_counter[signature] += 1
+        l.base_score = _adjusted_score(l)
+        lineups.append(l)
 
-        lineup_id = str(row.get("LineupID", row.get("id", idx + 1)))
-        lineup = Lineup(
-            idx=idx,
-            lineup_id=lineup_id,
-            slot_players=slot_players,
-            signature=signature,
-            metrics={},
-            base_score=0.0,
-            stack_tags={},
-        )
-        lineup.metrics["weight"] = float(weights[idx]) if idx < len(weights) else 1.0
-        lineups.append(lineup)
-
-    if not lineups:
-        raise ValueError("No valid lineups found in lineup file")
-
-    if not quiet:
-        dup_sizes = [c for c in dup_counter.values() if c > 1]
-        if dup_sizes:
-            LOG.info("Detected %d duplicated lineup signatures (max dup %d)", len(dup_sizes), max(dup_sizes))
-        else:
-            LOG.info("All lineups unique by signature")
-
-    return lineups, dup_counter
+    if _unused_args or _unused_kwargs:
+        return lineups, {}
+    return lineups
 
 
-# ---------------------------------------------------------------------------
-# Metrics + scoring
-# ---------------------------------------------------------------------------
-
-
-def _primary_team(players: Iterable[PlayerRecord]) -> Tuple[str, int, float]:
-    team_counts: Dict[str, List[PlayerRecord]] = collections.defaultdict(list)
-    for player in players:
-        if player.is_skater and player.team:
-            team_counts[player.team].append(player)
-    if not team_counts:
-        return "", 0, 0.0
-    best_team = ""
-    best_size = -1
-    best_proj = -1.0
-    for team, members in team_counts.items():
-        size = len(members)
-        proj = sum(float(p.projection or 0.0) for p in members)
-        if size > best_size or (size == best_size and proj > best_proj):
-            best_team = team
-            best_size = size
-            best_proj = proj
-    return best_team, best_size, best_proj
-
-
-def _group_counts(players: Iterable[PlayerRecord], key_fn) -> Dict[str, List[PlayerRecord]]:
-    buckets: Dict[str, List[PlayerRecord]] = collections.defaultdict(list)
-    for player in players:
-        key = key_fn(player)
-        if key:
-            buckets[key].append(player)
-    return buckets
-
-
-def _compute_lineup_metrics(lineup: Lineup) -> None:
-    players = list(lineup.players())
-
-    def _coerce_optional(value: object) -> Optional[float]:
-        if value in (None, ""):
-            return None
-        try:
-            num = float(value)
-        except (TypeError, ValueError):
-            return None
-        if math.isnan(num):
-            return None
-        return num
-
-    salary_vals = [_coerce_optional(p.salary) for p in players]
-    projection_vals = [_coerce_optional(p.projection) for p in players]
-    actual_vals = [_coerce_optional(p.actual) for p in players]
-    ceiling_vals = [_coerce_optional(p.ceiling) for p in players]
-
-    salary = sum(val for val in salary_vals if val is not None)
-    projection = sum(val for val in projection_vals if val is not None)
-    actual = sum(val for val in actual_vals if val is not None)
-    ceiling = sum(val for val in ceiling_vals if val is not None)
-
-    own_vals = [_coerce_optional(p.ownership) for p in players]
-    own_clean = [val for val in own_vals if val is not None]
-    own_sum = float(sum(own_clean)) if own_clean else float("nan")
-    own_hhi = (
-        float(sum((val / 100.0) ** 2 for val in own_clean)) if own_clean else float("nan")
-    )
-
-    goalie_team = next((p.team for p in players if p.is_goalie), "")
-    goalie_conflict = sum(1 for p in players if p.is_skater and p.opp and p.opp == goalie_team)
-
-    primary_team, _, _ = _primary_team(players)
-    opponent_candidates = {p.opp for p in players if p.team == primary_team and p.opp}
-    primary_opp = next(iter(opponent_candidates)) if opponent_candidates else ""
-    bringback_count = sum(1 for p in players if p.is_skater and p.team == primary_opp)
-
-    ev_groups = _group_counts(
-        (p for p in players if p.is_skater),
-        lambda p: f"{p.team}:{p.full}" if p.team and p.full else None,
-    )
-    ev_cluster_max = max((len(v) for v in ev_groups.values()), default=0)
-
-    pp_groups = _group_counts(
-        (p for p in players if p.is_skater and p.pp_unit == 1),
-        lambda p: p.team,
-    )
-    pp1_cluster = max((len(v) for v in pp_groups.values()), default=0)
-
-    skater_team_counts = collections.Counter(p.team for p in players if p.is_skater and p.team)
-    shape_counts = sorted((cnt for cnt in skater_team_counts.values() if cnt > 0), reverse=True)
-    lineup_shape = "-".join(str(cnt) for cnt in shape_counts) if shape_counts else ""
-
-    ev_stack_strings = [f"EV:{team}:{len(members)}" for team, members in sorted(ev_groups.items(), key=lambda kv: len(kv[1]), reverse=True) if members]
-    pp_stack_strings = [f"PP1:{team}:{len(members)}" for team, members in sorted(pp_groups.items(), key=lambda kv: len(kv[1]), reverse=True) if members]
-
-    actual_metric = actual if actual_vals and any(val is not None for val in actual_vals) else float("nan")
-    ceiling_metric = ceiling if ceiling_vals and any(val is not None for val in ceiling_vals) else float("nan")
-
-    lineup.metrics.update(
-        {
-            "salary": salary,
-            "projection": projection,
-            "actual": actual_metric,
-            "ceiling": ceiling_metric,
-            "salary_leftover": DK_SALARY_CAP - salary if salary_vals else float("nan"),
-            "ownership_sum": own_sum,
-            "ownership_hhi": own_hhi,
-            "goalie_conflict": float(goalie_conflict),
-            "bringback_count": float(bringback_count),
-            "ev_cluster": float(ev_cluster_max),
-            "pp1_cluster": float(pp1_cluster),
-            "primary_team": primary_team,
-            "primary_opponent": primary_opp,
-            "lineup_shape": lineup_shape,
-        }
-    )
-
-    lineup.stack_tags = {
-        "Stack1 Type": ev_stack_strings[0] if ev_stack_strings else "",
-        "Stack2 Type": pp_stack_strings[0] if pp_stack_strings else "",
-        "Lineup Type": lineup_shape,
-    }
-    lineup.metrics["ev_stacks"] = [(team, members[0].full, len(members)) for team, members in ev_groups.items() if members]
-    lineup.metrics["pp1_stacks"] = [(team, len(members)) for team, members in pp_groups.items() if members]
-
-
-def _ownership_penalties(metrics: Dict[str, float], cfg: Dict[str, object]) -> float:
-    own_cfg = cfg.get("ownership", {}) if isinstance(cfg, dict) else {}
-    if not own_cfg or not own_cfg.get("enable"):
-        return 0.0
-    penalty = 0.0
-    own_sum = metrics.get("ownership_sum")
-    own_hhi = metrics.get("ownership_hhi")
-    max_sum = own_cfg.get("max_sum")
-    max_hhi = own_cfg.get("max_hhi")
-    if isinstance(own_sum, float) and not math.isnan(own_sum) and max_sum is not None and own_sum > max_sum:
-        penalty += own_cfg.get("sum_penalty", 1.0)
-    if isinstance(own_hhi, float) and not math.isnan(own_hhi) and max_hhi is not None and own_hhi > max_hhi:
-        penalty += own_cfg.get("hhi_penalty", 0.5)
-    return penalty
-
-
-def _adjusted_score(metrics: Dict[str, float], cfg: Dict[str, object]) -> float:
-    def _metric(key: str, default: float = 0.0) -> float:
-        value = metrics.get(key, default)
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            return default
-        if math.isnan(numeric):
-            return default
-        return numeric
-
-    score = _metric("projection", 0.0)
-    score += 0.5 * max(0.0, _metric("ev_cluster", 0.0) - 2.0)
-    score += 0.4 * max(0.0, _metric("pp1_cluster", 0.0) - 2.0)
-    score -= 3.0 * _metric("goalie_conflict", 0.0)
-    score -= 1.0 * min(2.0, _metric("bringback_count", 0.0))
-    salary_left = _metric("salary_leftover", 0.0)
-    score -= 0.1 * max(0.0, salary_left - 500.0) / 100.0
-    score -= _ownership_penalties(metrics, cfg)
-    return score
-
-
-# ---------------------------------------------------------------------------
-# Simulation
-# ---------------------------------------------------------------------------
-
-
-def _prepare_sim(lineups: List[Lineup], cfg: Dict[str, object]) -> None:
+# legacy hook for tests / compatibility
+def _prepare_sim(lineups: List[Lineup], cfg: Optional[dict] = None) -> None:
     for lineup in lineups:
-        _compute_lineup_metrics(lineup)
-        lineup.base_score = _adjusted_score(lineup.metrics, cfg)
+        lineup.metrics = _compute_lineup_metrics(lineup)
+        lineup.base_score = _adjusted_score(lineup)
 
 
+# ----------------------- Simulation core ---------------------
 @dataclass
 class SimulationResults:
-    lineup_table: pd.DataFrame
-    player_table: pd.DataFrame
-    stack_table: pd.DataFrame
+    lineup_wins: np.ndarray
+    lineup_counts: np.ndarray
+    lineup_dup_counts: np.ndarray
+    player_wins: Dict[str, int]
+    player_counts: Dict[str, int]
+    ev_stack_counts: Dict[Tuple[str, str, int], int]
+    pp_stack_counts: Dict[Tuple[str, int], int]
+    shape_counts: Dict[str, int]
+    goalie_conflict_counts: Dict[str, int]
 
 
-def _run_simulation(
+class LegacySimulationResults:
+    def __init__(
+        self,
+        lineups: List[Lineup],
+        sim: SimulationResults,
+        field_size: int,
+        iterations: int,
+    ) -> None:
+        self.raw = sim
+        self.lineup_table = _lineups_table(lineups, sim, field_size, iterations)
+        self.player_table = _player_exposure_table(lineups, sim, field_size, iterations)
+        self.stack_table = _stack_exposure_table(sim)
+
+
+def _simulate_field(
     lineups: List[Lineup],
-    dup_counter: Dict[str, int],
-    iterations: int,
     field_size: int,
+    iterations: int,
     rng: np.random.Generator,
 ) -> SimulationResults:
     n = len(lineups)
-    weights = np.array([max(lineup.metrics.get("weight", 1.0), 0.0) for lineup in lineups], dtype=float)
-    if weights.sum() <= 0:
-        weights = np.ones_like(weights)
-    probs = weights / weights.sum()
+    assert n > 0
 
-    lineup_counts = np.zeros(n, dtype=np.int64)
-    lineup_duplicate_counts = np.zeros(n, dtype=np.float64)
-    lineup_wins = np.zeros(n, dtype=np.int64)
+    # probabilities proportional to base_score (softmax for stability)
+    raw = np.array([l.base_score for l in lineups], dtype=float)
+    raw = raw - np.max(raw)
+    probs = np.exp(raw)
+    probs = probs / probs.sum()
 
-    total_entries = iterations * field_size
+    lineup_wins = np.zeros(n, dtype=int)
+    lineup_counts = np.zeros(n, dtype=int)         # total times each lineup appears in the field
+    lineup_dup_counts = np.zeros(n, dtype=int)     # total duplicates (count-1) accumulated
 
-    player_meta: Dict[str, Dict[str, object]] = {}
-    player_counts = collections.Counter()
-    player_wins = collections.Counter()
+    player_wins: Dict[str, int] = {}
+    player_counts: Dict[str, int] = {}
 
-    ev_stack_counts: Dict[Tuple[str, str, int], int] = collections.Counter()
-    pp_stack_counts: Dict[Tuple[str, int], int] = collections.Counter()
-    shape_counts: Dict[str, int] = collections.Counter()
-    goalie_conflict_counts: Dict[str, int] = collections.Counter()
+    ev_stack_counts: Dict[Tuple[str, str, int], int] = {}
+    pp_stack_counts: Dict[Tuple[str, int], int] = {}
+    shape_counts: Dict[str, int] = {}
+    goalie_conflict_counts: Dict[str, int] = {"has_conflict": 0, "no_conflict": 0}
 
     for _ in range(iterations):
         counts = rng.multinomial(field_size, probs)
@@ -593,276 +433,226 @@ def _run_simulation(
         best_scores = np.full(n, -np.inf, dtype=float)
         idx_ptr = 0
 
-        for lineup_idx, count in enumerate(counts):
-            if count == 0:
+        for idx, cnt in enumerate(counts):
+            if cnt == 0:
                 continue
 
-            lineup = lineups[lineup_idx]
-            lineup_counts[lineup_idx] += count
-            lineup_duplicate_counts[lineup_idx] += max(0, count - 1)
+            lu = lineups[idx]
+            lineup_counts[idx] += cnt
+            lineup_dup_counts[idx] += max(0, cnt - 1)
 
-            stack_weight = int(count)
-            for team, full, size in lineup.metrics.get("ev_stacks", []):
+            # stacks / shape / conflicts accounting
+            w = int(cnt)
+            for team, full, size in lu.metrics.get("ev_stacks", []):
                 if team and full:
-                    ev_stack_counts[(team, str(full), int(size))] += stack_weight
-            for team, size in lineup.metrics.get("pp1_stacks", []):
+                    ev_stack_counts[(team, str(full), int(size))] = ev_stack_counts.get((team, str(full), int(size)), 0) + w
+            for team, size in lu.metrics.get("pp1_stacks", []):
                 if team:
-                    pp_stack_counts[(team, int(size))] += stack_weight
-            shape = lineup.metrics.get("lineup_shape", "")
+                    pp_stack_counts[(team, int(size))] = pp_stack_counts.get((team, int(size)), 0) + w
+            shape = lu.metrics.get("lineup_shape", "")
             if shape:
-                shape_counts[shape] += stack_weight
-            if lineup.metrics.get("goalie_conflict", 0.0) > 0.0:
-                goalie_conflict_counts["has_conflict"] += stack_weight
+                shape_counts[shape] = shape_counts.get(shape, 0) + w
+            if lu.metrics.get("goalie_conflict", 0) > 0:
+                goalie_conflict_counts["has_conflict"] += w
             else:
-                goalie_conflict_counts["no_conflict"] += stack_weight
+                goalie_conflict_counts["no_conflict"] += w
 
-            entry_noise = noise[idx_ptr : idx_ptr + count]
-            idx_ptr += count
-            if entry_noise.size:
-                entry_scores = lineup.base_score + entry_noise
-                max_entry = float(np.max(entry_scores))
-                if max_entry > best_scores[lineup_idx]:
-                    best_scores[lineup_idx] = max_entry
+            # player sim ownership accounting
+            for p in lu.players():
+                key = normalize_name(p.name)
+                player_counts[key] = player_counts.get(key, 0) + cnt
+                if key not in player_wins:
+                    player_wins[key] = 0
 
-            for player in lineup.players():
-                key = normalize_name(player.name)
-                player_counts[key] += count
-                if key not in player_meta:
-                    player_meta[key] = {
-                        "Player": player.name,
-                        "Position": player.position,
-                        "Team": player.team,
-                        "Fpts Act": player.actual,
-                        "Proj Own%": player.ownership,
-                    }
+            # sample cnt entries for this lineup and keep max score for winner selection
+            entry_noise = noise[idx_ptr: idx_ptr + cnt]
+            idx_ptr += cnt
+            max_entry = float(np.max(lu.base_score + entry_noise))
+            if max_entry > best_scores[idx]:
+                best_scores[idx] = max_entry
 
+        # choose a single winner this iteration
         winner_idx = int(best_scores.argmax())
         if best_scores[winner_idx] > -np.inf:
             lineup_wins[winner_idx] += 1
-            winning_lineup = lineups[winner_idx]
-            for player in winning_lineup.players():
-                player_wins[normalize_name(player.name)] += 1
+            for p in lineups[winner_idx].players():
+                player_wins[normalize_name(p.name)] = player_wins.get(normalize_name(p.name), 0) + 1
 
-    # Build lineup table
-    lineup_rows: List[Dict[str, object]] = []
-    total_counts = float(total_entries) if total_entries else 1.0
-    for idx, lineup in enumerate(lineups):
-        slots = {slot: "" for slot in DK_SLOTS}
-        for slot, player in lineup.slot_players.items():
-            slots[slot] = player.name
-        win_pct = (lineup_wins[idx] / iterations * 100.0) if iterations else 0.0
-        sim_own_pct = lineup_counts[idx] / total_counts * 100.0 if total_counts else 0.0
-        sim_dupes = lineup_duplicate_counts[idx] / iterations if iterations else 0.0
-        row = {
-            "Lineup": lineup.lineup_id,
-            "Win%": win_pct,
-            "Top1%": win_pct,
-            "Avg Return": float("nan"),
-            "Fpts Proj": lineup.metrics.get("projection"),
-            "Field Fpts Proj": lineup.base_score,
-            "Fpts Act": lineup.metrics.get("actual"),
-            "Ceiling": lineup.metrics.get("ceiling"),
-            "Salary": lineup.metrics.get("salary"),
-            "Salary Leftover": lineup.metrics.get("salary_leftover"),
-            "EV Cluster": lineup.metrics.get("ev_cluster"),
-            "PP1 Cluster": lineup.metrics.get("pp1_cluster"),
-            "BringBacks": lineup.metrics.get("bringback_count"),
-            "Skaters vs Goalie": lineup.metrics.get("goalie_conflict"),
-            "Own Sum": lineup.metrics.get("ownership_sum"),
-            "HHI": lineup.metrics.get("ownership_hhi"),
-            "Lineup Dupes": dup_counter.get(lineup.signature, 1),
-            "Sim Dupes": sim_dupes,
-            "Sim Own%": sim_own_pct,
-        }
-        row.update(slots)
-        row.update(lineup.stack_tags)
-        lineup_rows.append(row)
-
-    lineup_table = pd.DataFrame(lineup_rows)
-    ordered_cols = (
-        DK_SLOTS
-        + [
-            "Lineup",
-            "Fpts Proj",
-            "Field Fpts Proj",
-            "Fpts Act",
-            "Ceiling",
-            "Salary",
-            "Salary Leftover",
-            "EV Cluster",
-            "PP1 Cluster",
-            "BringBacks",
-            "Skaters vs Goalie",
-            "Own Sum",
-            "HHI",
-            "Lineup Dupes",
-            "Sim Dupes",
-            "Sim Own%",
-            "Win%",
-            "Top1%",
-            "Avg Return",
-            "Stack1 Type",
-            "Stack2 Type",
-            "Lineup Type",
-        ]
+    return SimulationResults(
+        lineup_wins=lineup_wins,
+        lineup_counts=lineup_counts,
+        lineup_dup_counts=lineup_dup_counts,
+        player_wins=player_wins,
+        player_counts=player_counts,
+        ev_stack_counts=ev_stack_counts,
+        pp_stack_counts=pp_stack_counts,
+        shape_counts=shape_counts,
+        goalie_conflict_counts=goalie_conflict_counts,
     )
-    lineup_table = lineup_table[[c for c in ordered_cols if c in lineup_table.columns]]
-
-    # Player exposures
-    player_rows: List[Dict[str, object]] = []
-    for key, meta in sorted(player_meta.items(), key=lambda kv: kv[1]["Player"].lower()):
-        count = player_counts.get(key, 0)
-        wins = player_wins.get(key, 0)
-        sim_pct = count / total_counts * 100.0 if total_counts else 0.0
-        win_pct = wins / iterations * 100.0 if iterations else 0.0
-        player_rows.append(
-            {
-                "Player": meta.get("Player"),
-                "Position": meta.get("Position"),
-                "Team": meta.get("Team"),
-                "Fpts Act": meta.get("Fpts Act"),
-                "Win%": win_pct,
-                "Top1%": win_pct,
-                "Sim. Own%": sim_pct,
-                "Proj. Own%": meta.get("Proj Own%"),
-                "Avg. Return": float("nan"),
-            }
-        )
-
-    player_table = pd.DataFrame(player_rows)
-
-    # Stack exposures
-    stack_rows: List[Dict[str, object]] = []
-    if ev_stack_counts:
-        for (team, ev_line, size), count in sorted(ev_stack_counts.items(), key=lambda kv: (-kv[1], kv[0])):
-            stack_rows.append(
-                {
-                    "Category": "EV Stack",
-                    "Team": team,
-                    "Descriptor": ev_line,
-                    "Size": size,
-                    "Sim%": count / total_entries * 100.0 if total_entries else 0.0,
-                }
-            )
-    if pp_stack_counts:
-        for (team, size), count in sorted(pp_stack_counts.items(), key=lambda kv: (-kv[1], kv[0])):
-            stack_rows.append(
-                {
-                    "Category": "PP1 Stack",
-                    "Team": team,
-                    "Descriptor": "PP1",
-                    "Size": size,
-                    "Sim%": count / total_entries * 100.0 if total_entries else 0.0,
-                }
-            )
-    if shape_counts:
-        for shape, count in sorted(shape_counts.items(), key=lambda kv: (-kv[1], kv[0])):
-            stack_rows.append(
-                {
-                    "Category": "Lineup Shape",
-                    "Team": "",
-                    "Descriptor": shape,
-                    "Size": np.nan,
-                    "Sim%": count / total_entries * 100.0 if total_entries else 0.0,
-                }
-            )
-    if goalie_conflict_counts:
-        for descriptor, count in sorted(goalie_conflict_counts.items(), key=lambda kv: (-kv[1], kv[0])):
-            pretty = {
-                "has_conflict": "Has Conflict",
-                "no_conflict": "No Conflict",
-            }.get(descriptor, descriptor)
-            stack_rows.append(
-                {
-                    "Category": "Skaters vs Goalie",
-                    "Team": "",
-                    "Descriptor": pretty,
-                    "Size": np.nan,
-                    "Sim%": count / total_entries * 100.0 if total_entries else 0.0,
-                }
-            )
-
-    stack_table = pd.DataFrame(stack_rows)
-    return SimulationResults(lineup_table=lineup_table, player_table=player_table, stack_table=stack_table)
 
 
-# ---------------------------------------------------------------------------
-# Output + CLI entry point
-# ---------------------------------------------------------------------------
+def _run_simulation(lineups: List[Lineup], *args):
+    if len(args) == 3 and not isinstance(args[0], dict):
+        field_size, iterations, rng = args
+        if not isinstance(field_size, int):
+            raise TypeError("field_size must be int when calling _run_simulation(lineups, field_size, iterations, rng)")
+        return _simulate_field(lineups, field_size, iterations, rng)
+    if len(args) == 4 and isinstance(args[0], dict):
+        _, field_size, iterations, rng = args
+        sim = _simulate_field(lineups, field_size, iterations, rng)
+        return LegacySimulationResults(lineups, sim, field_size, iterations)
+    raise TypeError("Unsupported arguments for _run_simulation")
 
 
-def _ensure_outdir(path: str) -> str:
-    os.makedirs(path, exist_ok=True)
-    return path
+# ----------------------- Outputs -----------------------------
+def _lineups_table(
+    lineups: List[Lineup],
+    sim: SimulationResults,
+    field_size: int,
+    iterations: int,
+) -> pd.DataFrame:
+    rows = []
+    denom_field = max(1, field_size * iterations)
+    denom_iters = max(1, iterations)
+
+    for i, lu in enumerate(lineups):
+        m = lu.metrics
+        row = {slot: "" for slot in DK_SLOTS}
+        for s in DK_SLOTS:
+            if s in lu.slots:
+                row[s] = lu.slots[s].name
+
+        row.update({
+            "Lineup": lu.id,
+            "Fpts Proj": float(m.get("projection", 0.0)),
+            "Field Fpts Proj": float(lu.base_score),
+            "Fpts Act": -2,          # keep placeholder column for parity (if no actuals)
+            "Ceiling": float(m.get("ceiling", 0.0)),
+            "Salary": float(m.get("salary", 0.0)),
+            "Salary Left": max(0.0, 50000.0 - float(m.get("salary", 0.0))),
+            "EV Cluster": int(m.get("ev_cluster", 0)),
+            "PP1 Cluster": int(m.get("pp1_cluster", 0)),
+            "BringBacks": int(m.get("bringbacks", 0)),
+            "Skaters vs Goalie": int(m.get("goalie_conflict", 0)),
+            "Own Sum": np.nan,  # optional; left for future ownership integration
+            "HHI": np.nan,      # optional
+            "Lineup Dupes": 1,  # the input lineups are unique rows
+            "Sim Dupes": int(sim.lineup_dup_counts[i]),
+            "Sim Own%": 100.0 * sim.lineup_counts[i] / denom_field,
+            "Win%": 100.0 * sim.lineup_wins[i] / denom_iters,
+            "Top1%": 100.0 * sim.lineup_wins[i] / denom_iters,
+            "Avg Return": 0.0,  # optional if we add payout model later
+            "Stack1 Typ": "",
+            "Stack2 Typ": "",
+            "Lineup Type": m.get("lineup_shape", ""),
+        })
+        # labels for top stacks (if present)
+        if m.get("ev_stacks"):
+            t, f, sz = sorted(m["ev_stacks"], key=lambda x: x[2], reverse=True)[0]
+            row["Stack1 Typ"] = f"EV:{t}:{sz}"
+        if m.get("pp1_stacks"):
+            t, sz = sorted(m["pp1_stacks"], key=lambda x: x[1], reverse=True)[0]
+            row["Stack2 Typ"] = f"PP1:{t}:{sz}"
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def _player_exposure_table(
+    lineups: List[Lineup],
+    sim: SimulationResults,
+    field_size: int,
+    iterations: int,
+) -> pd.DataFrame:
+    denom_field = max(1, field_size * iterations)
+    denom_iters = max(1, iterations)
+
+    counts: Dict[str, int] = sim.player_counts
+    wins: Dict[str, int] = sim.player_wins
+
+    # build roster-level meta to get Position/Team
+    meta: Dict[str, Tuple[str, str]] = {}
+    for lu in lineups:
+        for p in lu.players():
+            key = normalize_name(p.name)
+            if key not in meta:
+                meta[key] = (p.position, p.team)
+
+    rows = []
+    for key, cnt in counts.items():
+        win = wins.get(key, 0)
+        pos, team = meta.get(key, ("", ""))
+        rows.append({
+            "Player": key,  # normalized name
+            "Position": pos,
+            "Team": team,
+            "Win%": 100.0 * win / denom_iters,
+            "Sim. Own%": 100.0 * cnt / denom_field,
+            "Proj. Own%": np.nan,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def _stack_exposure_table(sim: SimulationResults) -> pd.DataFrame:
+    rows = []
+    for (team, full, size), cnt in sim.ev_stack_counts.items():
+        rows.append({"Type": "EV", "Team": team, "Unit": str(full), "Size": int(size), "Sim%": cnt})
+    for (team, size), cnt in sim.pp_stack_counts.items():
+        rows.append({"Type": "PP1", "Team": team, "Unit": "1", "Size": int(size), "Sim%": cnt})
+    for shape, cnt in sim.shape_counts.items():
+        rows.append({"Type": "Shape", "Team": "", "Unit": "", "Size": 0, "Sim%": cnt})
+    for k, cnt in sim.goalie_conflict_counts.items():
+        rows.append({"Type": "VsGoalie", "Team": "", "Unit": k, "Size": 0, "Sim%": cnt})
+    return pd.DataFrame(rows)
 
 
 def _write_outputs(
-    results: SimulationResults,
-    site: str,
     outdir: str,
     field_size: int,
     iterations: int,
-) -> Tuple[str, str, str]:
-    prefix = f"{site.upper()}_gpp_sim"
-    lineup_path = os.path.join(outdir, f"{prefix}_lineups_{field_size}_{iterations}.csv")
-    player_path = os.path.join(outdir, f"{prefix}_player_exposure_{field_size}_{iterations}.csv")
-    stack_path = os.path.join(outdir, f"{prefix}_stack_exposure_{field_size}_{iterations}.csv")
-
-    results.lineup_table.to_csv(lineup_path, index=False)
-    results.player_table.to_csv(player_path, index=False)
-    results.stack_table.to_csv(stack_path, index=False)
-    return lineup_path, player_path, stack_path
-
-
-def _configure_logging(quiet: bool) -> None:
-    level = logging.WARNING if quiet else logging.INFO
-    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
-    LOG.setLevel(level)
+    lineups_df: pd.DataFrame,
+    players_df: pd.DataFrame,
+    lineups_table: pd.DataFrame,
+    player_exposure: pd.DataFrame,
+    stack_exposure: pd.DataFrame,
+) -> None:
+    os.makedirs(outdir, exist_ok=True)
+    lineups_out = os.path.join(outdir, f"DK_gpp_sim_lineups_{field_size}_{iterations}.csv")
+    players_out = os.path.join(outdir, f"DK_gpp_sim_player_exposure_{field_size}_{iterations}.csv")
+    stacks_out = os.path.join(outdir, f"DK_gpp_sim_stack_exposure_{field_size}_{iterations}.csv")
+    lineups_table.to_csv(lineups_out, index=False)
+    player_exposure.to_csv(players_out, index=False)
+    stack_exposure.to_csv(stacks_out, index=False)
 
 
-def main(args: argparse.Namespace | Sequence[str] | None = None) -> None:
-    ns = _coerce_namespace(args)
-    _configure_logging(ns.quiet)
+# ----------------------- Entry point -------------------------
+def main(args: argparse.Namespace) -> None:
+    rng = np.random.default_rng(args.seed)
 
-    if ns.site.upper() != "DK":
-        raise SystemExit("Only DraftKings (DK) simulations are supported at this time")
+    lineups_df = _read_lineups(args.lineups)
+    players_df = load_player_reference_for_date(args.players, args.date)
 
-    cfg = _load_config(ns.config) if ns.config else {}
+    lineups = _build_lineups(lineups_df, players_df)
+    sim = _run_simulation(lineups, args.field_size, args.iterations, rng)
 
-    player_lookup: Dict[str, List[pd.Series]] = {}
-    ownership_df: Optional[pd.DataFrame] = None
-    if ns.players:
-        players_df = load_player_reference_for_date(ns.players, ns.date)
-        if ns.ownership_file:
-            players_df = apply_external_ownership(players_df, ns.ownership_file, None)
-        player_lookup = collections.defaultdict(list)
-        for _, row in players_df.iterrows():
-            player_lookup[normalize_name(row["Name"])].append(row)
-        if "Ownership" in players_df.columns:
-            ownership_df = players_df[["Name", "Team", "Pos", "Ownership"]].copy()
-    elif ns.ownership_file:
-        ownership_df = apply_external_ownership(pd.DataFrame(), ns.ownership_file, None)
+    lineups_table = _lineups_table(lineups, sim, args.field_size, args.iterations)
+    player_exposure = _player_exposure_table(lineups, sim, args.field_size, args.iterations)
+    stack_exposure = _stack_exposure_table(sim)
 
-    if not player_lookup and not ns.quiet:
-        LOG.warning("No player reference data provided; metrics may be sparse")
-
-    df = _read_lineups_csv(ns.lineups)
-    lineups, dup_counter = _build_lineups(df, player_lookup, ownership_df, ns.quiet)
-    _prepare_sim(lineups, cfg)
-
-    rng = np.random.default_rng(ns.seed)
-    results = _run_simulation(lineups, dup_counter, ns.iterations, ns.field_size, rng)
-
-    outdir = _ensure_outdir(ns.outdir)
-    lineup_path, player_path, stack_path = _write_outputs(
-        results, ns.site, outdir, ns.field_size, ns.iterations
-    )
-
-    if not ns.quiet:
-        LOG.info("Wrote lineups CSV -> %s", lineup_path)
-        LOG.info("Wrote player exposure CSV -> %s", player_path)
-        LOG.info("Wrote stack exposure CSV -> %s", stack_path)
+    _write_outputs(args.outdir, args.field_size, args.iterations,
+                   lineups_df, players_df, lineups_table, player_exposure, stack_exposure)
 
 
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser()
+    p.add_argument("--site", default="DK")
+    p.add_argument("--field-size", type=int, required=True)
+    p.add_argument("--iterations", type=int, required=True)
+    p.add_argument("--lineups", required=True, help="optimizer output CSV of unique lineups")
+    p.add_argument("--players", required=True, help="dir or CSV of player refs (Labs)")
+    p.add_argument("--date", default=None, help="slate date YYYY-MM-DD for filtering player refs")
+    p.add_argument("--outdir", default="output")
+    p.add_argument("--seed", type=int, default=1337)
+    main(p.parse_args())
