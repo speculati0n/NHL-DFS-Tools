@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import unicodedata
 import re
-from typing import Dict, List, Sequence, TYPE_CHECKING
+from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import pandas as pd
 
@@ -24,7 +24,17 @@ def _normalize_name(name: str) -> str:
     return s
 
 
-def _build_id_index(path: str) -> Dict[str, str]:
+def _first_initial_key(nm: str) -> Optional[str]:
+    parts = [p for p in nm.split(" ") if p]
+    if len(parts) < 2:
+        return None
+    first, rest = parts[0], parts[1:]
+    if not first:
+        return None
+    return f"{first[0]} {' '.join(rest)}".strip()
+
+
+def _build_id_index(path: str) -> Dict[str, Tuple[str, str]]:
     if not os.path.exists(path):
         raise FileNotFoundError(path)
     df = pd.read_csv(path)
@@ -41,26 +51,42 @@ def _build_id_index(path: str) -> Dict[str, str]:
             break
     if not name_col or not id_col:
         raise ValueError("player_ids.csv missing name/id columns")
-    idx: Dict[str, str] = {}
+    idx: Dict[str, Tuple[str, str]] = {}
+    initial_candidates: Dict[str, List[Tuple[str, str]]] = {}
     for _, row in df.iterrows():
         nm = _normalize_name(row[name_col])
         pid = str(row[id_col]).strip()
-        if nm and pid:
-            idx[nm] = pid
+        canon = str(row[name_col]).strip()
+        if nm and pid and canon:
+            idx[nm] = (canon, pid)
+            alt = _first_initial_key(nm)
+            if alt and alt not in idx:
+                initial_candidates.setdefault(alt, []).append((canon, pid))
+
+    for alt, pids in initial_candidates.items():
+        uniq = {pid for _, pid in pids}
+        if len(uniq) == 1 and alt not in idx:
+            idx[alt] = pids[0]
     return idx
 
 
 def _format_cell(name: str, pid: str) -> str:
+    if not name:
+        return ""
     pid = pid or ""
     return f"{name} ({pid})"
 
 
-def _map_ids(names: Sequence[str], idx: Dict[str, str]) -> List[str]:
+def _map_ids(names: Sequence[str], idx: Dict[str, Tuple[str, str]]) -> List[str]:
     out = []
     for name in names:
         nm = _normalize_name(name)
-        pid = idx.get(nm, "")
-        out.append(_format_cell(name, pid))
+        match = idx.get(nm)
+        if match:
+            canon, pid = match
+            out.append(_format_cell(canon, pid))
+        else:
+            out.append(_format_cell(name, ""))
     return out
 
 

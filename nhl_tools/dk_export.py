@@ -36,20 +36,42 @@ def _pick(df: pd.DataFrame, *cands: str) -> Optional[str]:
             return cols[c.lower()]
     return None
 
-def _build_id_index(ids_df: pd.DataFrame) -> Dict[str, str]:
+def _first_initial_key(nm: str) -> Optional[str]:
+    parts = [p for p in nm.split(" ") if p]
+    if len(parts) < 2:
+        return None
+    first, rest = parts[0], parts[1:]
+    if not first:
+        return None
+    return f"{first[0]} {' '.join(rest)}".strip()
+
+
+def _build_id_index(ids_df: pd.DataFrame) -> Dict[str, Tuple[str, str]]:
     name_col = _pick(ids_df, "name", "player", "full_name", "playername", "dk_name")
     id_col   = _pick(ids_df, "player_id", "playerid", "dk_id", "draftkings_id", "id")
     if not name_col or not id_col:
         raise ValueError("player_ids.csv must have a name column and a dk id column.")
-    idx: Dict[str, str] = {}
+    idx: Dict[str, Tuple[str, str]] = {}
+    initial_candidates: Dict[str, List[Tuple[str, str]]] = {}
     for _, r in ids_df.iterrows():
         nm = _normalize_name(r[name_col])
         pid = str(r[id_col]).strip()
-        if nm and pid:
-            idx[nm] = pid
+        canon = str(r[name_col]).strip()
+        if nm and pid and canon:
+            idx[nm] = (canon, pid)
+            alt = _first_initial_key(nm)
+            if alt and alt not in idx:
+                initial_candidates.setdefault(alt, []).append((canon, pid))
+
+    for alt, pids in initial_candidates.items():
+        uniq = {pid for _, pid in pids}
+        if len(uniq) == 1 and alt not in idx:
+            idx[alt] = pids[0]
     return idx
 
 def _fmt_cell(name: str, pid: Optional[str]) -> str:
+    if not name:
+        return ""
     pid = pid or ""
     return f"{name} ({pid})"
 
@@ -142,10 +164,17 @@ def format_with_ids(wide_df: pd.DataFrame, player_ids_df: pd.DataFrame) -> pd.Da
         vals = []
         for i, name in enumerate(out[c].fillna("").astype(str).tolist()):
             nm = _normalize_name(name)
-            pid = idx.get(nm, "")
-            if name and not pid:
-                unmatched.append((int(out.loc[i, "LineupID"]), c, name))
-            vals.append(_fmt_cell(name, pid) if name else "")
+            match = idx.get(nm)
+            if match:
+                canon_name, pid = match
+                vals.append(_fmt_cell(canon_name, pid))
+            else:
+                pid = ""
+                if name:
+                    unmatched.append((int(out.loc[i, "LineupID"]), c, name))
+                    vals.append(_fmt_cell(name, pid))
+                else:
+                    vals.append("")
         out[c] = vals
 
     # Attach unmatched list for sidecar writing
