@@ -11,7 +11,7 @@ import pandas as pd
 if TYPE_CHECKING:  # pragma: no cover
     from nhl_tools.nhl_optimizer import LineupResult
 
-UPLOAD_COLUMNS = ["C", "W", "W", "D", "D", "G", "UTIL", "UTIL"]
+UPLOAD_COLUMNS = ["C", "C", "W", "W", "W", "D", "D", "G", "UTIL"]
 
 
 def _normalize_name(name: str) -> str:
@@ -79,27 +79,27 @@ def export_dk_upload(
     records: List[List[str]] = []
 
     for lu in lineups:
-        slots = lu.slots
-        c1 = slots.get("C1")
-        c2 = slots.get("C2")
-        wings = [slots.get("W1"), slots.get("W2"), slots.get("W3")]
-        defenders = [slots.get("D1"), slots.get("D2")]
-        goalie = slots.get("G")
-        util = slots.get("UTIL")
+        slot_order = [
+            "C1",
+            "C2",
+            "W1",
+            "W2",
+            "W3",
+            "D1",
+            "D2",
+            "G",
+            "UTIL",
+        ]
 
-        picked_order = []
-        picked_order.append(c1)
-        picked_order.append(wings[0])
-        picked_order.append(wings[1])
-        picked_order.append(defenders[0])
-        picked_order.append(defenders[1])
-        picked_order.append(goalie)
-        picked_order.append(util)
+        picked_order = [lu.slots.get(slot) for slot in slot_order]
 
         consumed = {idx for idx in picked_order if idx is not None}
         remaining = [i for i in lu.indices if i not in consumed]
         remaining.sort(key=lambda i: float(pool.loc[i, "Proj"]), reverse=True)
-        picked_order.append(remaining[0] if remaining else None)
+
+        for pos, idx in enumerate(picked_order):
+            if idx is None:
+                picked_order[pos] = remaining.pop(0) if remaining else None
 
         names = [pool.loc[i, "Name"] if i is not None else "" for i in picked_order]
         records.append(_map_ids(names, id_index))
