@@ -8,6 +8,7 @@ from nhl_tools.nhl_simulator import (
     Lineup,
     PlayerRecord,
     _build_lineups,
+    _format_player_cell,
     _prepare_sim,
     _run_simulation,
 )
@@ -114,6 +115,7 @@ def test_build_lineups_extracts_slot_metadata_and_scores():
             "C1 Pos": ["C"],
             "C1 Salary": [5200],
             "C1 Proj": ["9.5"],
+            "C1 ID": [12345],
             "C2 Name": ["Bravo"],
             "C2 Team": ["AAA"],
             "C2 Pos": ["C"],
@@ -124,6 +126,7 @@ def test_build_lineups_extracts_slot_metadata_and_scores():
             "W1 Pos": ["W"],
             "W1 Salary": [4900],
             "W1 Proj": ["8.6"],
+            "W1 ID": ["22222"],
             "W2 Name": ["Delta"],
             "W2 Team": ["AAA"],
             "W2 Pos": ["W"],
@@ -139,6 +142,7 @@ def test_build_lineups_extracts_slot_metadata_and_scores():
             "D1 Pos": ["D"],
             "D1 Salary": [4400],
             "D1 Proj": ["7.2"],
+            "D1 ID": ["00333"],
             "D2 Name": ["Golf"],
             "D2 Team": ["AAA"],
             "D2 Pos": ["D"],
@@ -159,12 +163,21 @@ def test_build_lineups_extracts_slot_metadata_and_scores():
             "UTIL2 Pos": ["C"],
             "UTIL2 Salary": [3500],
             "UTIL2 Proj": ["4.9"],
+            "UTIL2 ID": [np.nan],
         }
     )
 
     lineups, _ = _build_lineups(df, {}, None, quiet=True)
     assert len(lineups) == 1
     lineup = lineups[0]
+
+    assert lineup.slots["C1"].player_id == "12345"
+    assert _format_player_cell(lineup.slots["C1"]) == "Alpha (12345)"
+    assert lineup.slots["W1"].player_id == "22222"
+    assert _format_player_cell(lineup.slots["W1"]) == "Charlie (22222)"
+    # Ensure NaN IDs remain absent
+    assert lineup.slots["UTIL2"].player_id is None
+    assert _format_player_cell(lineup.slots["UTIL2"]) == "Juliet"
 
     _prepare_sim(lineups, cfg={})
 
