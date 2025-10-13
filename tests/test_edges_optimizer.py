@@ -9,6 +9,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from nhl_tools.nhl_optimizer import EdgesOptimizer, ShapePlan
+from nhl_tools.nhl_data import _normalize_opp
 
 
 def _sample_pool() -> pd.DataFrame:
@@ -80,3 +81,39 @@ def test_edges_optimizer_constraints():
     assert lu.salary >= 49500
     if not math.isnan(lu.ownership_sum):
         assert lu.ownership_sum <= 300.0
+
+
+def test_goalie_conflict_with_verbose_opp_strings():
+    pool = _sample_pool().copy()
+    pool.loc[pool["Team"] == "AAA", "Opp"] = pool.loc[pool["Team"] == "AAA", "Opp"].apply(
+        lambda opp: f"vs {opp} - Confirmed Starter"
+    )
+    pool.loc[pool["Name"] == "G_A", "Opp"] = "VS BBB - Confirmed"
+    pool.loc[pool["Name"] == "G_B", "Opp"] = "@ AAA (Probable Goalie)"
+
+    pool["Opp"] = pool["Opp"].map(_normalize_opp)
+    assert set(pool.loc[pool["Team"] == "AAA", "Opp"]) == {"BBB"}
+    assert pool.loc[pool["Name"] == "G_B", "Opp"].iloc[0] == "AAA"
+
+    cfg = _config()
+    optimizer = EdgesOptimizer(
+        pool,
+        cfg,
+        [ShapePlan([4, 3, 1], primary_mode="ev")],
+        tie_break_random_pct=0.0,
+        bringbacks_enabled=False,
+        max_from_opponent=0,
+        forbid_goalie_conflict=True,
+        salary_min=49500,
+        salary_max=50000,
+        ownership_limits={"max_sum": 300.0, "max_hhi": 0.5},
+    )
+
+    lineups = optimizer.build_lineups(1, projection_guard=None, require_unique=True, max_duplication=None)
+    assert lineups, "Expected at least one lineup"
+    lu = lineups[0]
+
+    goalie_team = pool.loc[lu.slots["G"], "Team"]
+    for idx in lu.indices:
+        if pool.loc[idx, "IsSkater"]:
+            assert pool.loc[idx, "Opp"] != goalie_team
