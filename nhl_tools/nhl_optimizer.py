@@ -514,15 +514,43 @@ class EdgesOptimizer:
 
     # ------------------------------------------------------------------
     def _compute_best_projection(self) -> float:
-        projections = {i: float(self.pool.loc[i, "ProjBase"]) for i in self.pool.index}
-        cuts: List[Tuple[List[int], int]] = []
-        best = 0.0
-        for plan in self.shapes:
-            lineup = self._solve_one(plan, projections, cuts)
-            if lineup:
-                best = max(best, lineup.projection_base)
-                cuts.append((lineup.indices, len(lineup.indices) - 1))
-        return best
+        players = list(self.pool.index)
+        prob = pulp.LpProblem("nhl_max_proj", pulp.LpMaximize)
+        x = {i: pulp.LpVariable(f"best_x_{i}", lowBound=0, upBound=1, cat="Binary") for i in players}
+
+        # Salary window (respect the configured min / max spend)
+        prob += pulp.lpSum(self.pool.loc[i, "Salary"] * x[i] for i in players) >= self.salary_min
+        prob += pulp.lpSum(self.pool.loc[i, "Salary"] * x[i] for i in players) <= self.salary_max
+
+        # Roster requirements (DK format: 8 skaters + 1 goalie with UTIL flexibility)
+        prob += pulp.lpSum(x[i] for i in players) == 9
+        prob += pulp.lpSum(x[i] for i in self.goalies) == 1
+        prob += pulp.lpSum(x[i] for i in self.skaters) == 8
+
+        def pos_filter(pos: str) -> Iterable[int]:
+            return [i for i in players if self.pool.loc[i, "Pos"] == pos]
+
+        prob += pulp.lpSum(x[i] for i in pos_filter("C")) >= DK_ROSTER["C"]
+        prob += pulp.lpSum(x[i] for i in pos_filter("C")) <= DK_ROSTER["C"] + 1
+        prob += pulp.lpSum(x[i] for i in pos_filter("W")) >= DK_ROSTER["W"]
+        prob += pulp.lpSum(x[i] for i in pos_filter("W")) <= DK_ROSTER["W"] + 1
+        prob += pulp.lpSum(x[i] for i in pos_filter("D")) >= DK_ROSTER["D"]
+        prob += pulp.lpSum(x[i] for i in pos_filter("D")) <= DK_ROSTER["D"] + 1
+
+        # Objective: maximize raw projections without any additional bonuses/penalties
+        prob += pulp.lpSum(float(self.pool.loc[i, "ProjBase"]) * x[i] for i in players)
+
+        status = prob.solve(pulp.PULP_CBC_CMD(msg=False))
+        if status != pulp.LpStatusOptimal:
+            LOG.warning("Failed to solve max projection problem (status=%s)", pulp.LpStatus.get(status))
+            return 0.0
+
+        picked = [i for i, var in x.items() if var.value() and var.value() > 0.5]
+        if len(picked) != 9:
+            LOG.warning("Max projection solve returned %d players", len(picked))
+            return 0.0
+
+        return float(self.pool.loc[picked, "ProjBase"].sum())
 
 
 # ------------------------------------------------------------------------------
