@@ -144,6 +144,7 @@ def _extract_slot_value(row: pd.Series, col: str) -> Tuple[str, Optional[str]]:
 
 
 
+
 # ----------------------- Player helpers ----------------------
 def _player_key(player: PlayerRecord) -> str:
     """Normalized key for aggregating players across outputs."""
@@ -335,7 +336,7 @@ def _build_lineups(lineups_df: pd.DataFrame,
                         return row.get(c)
                 return None
 
-            id_from_column = _normalize_player_id(_lookup("ID"))
+
             if id_from_column:
                 name_player_id = id_from_column
 
