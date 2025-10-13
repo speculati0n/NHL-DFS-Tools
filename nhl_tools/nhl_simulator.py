@@ -143,23 +143,6 @@ def _extract_slot_value(row: pd.Series, col: str) -> Tuple[str, Optional[str]]:
     return str(v), pid
 
 
-def _normalize_player_id(value: Optional[object]) -> Optional[str]:
-    if value in (None, ""):
-        return None
-    if isinstance(value, float):
-        if math.isnan(value):
-            return None
-        if value.is_integer():
-            return str(int(value))
-        return str(value).strip()
-    if isinstance(value, (int, np.integer)):
-        return str(int(value))
-    if isinstance(value, str):
-        stripped = value.strip()
-        return stripped or None
-    text = str(value).strip()
-    return text or None
-
 
 # ----------------------- Player helpers ----------------------
 def _player_key(player: PlayerRecord) -> str:
