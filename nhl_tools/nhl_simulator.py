@@ -143,41 +143,6 @@ def _extract_slot_value(row: pd.Series, col: str) -> Tuple[str, Optional[str]]:
     return str(v), pid
 
 
-def _coerce_player_id_value(value: Optional[object]) -> Optional[str]:
-    if value in (None, ""):
-        return None
-    if isinstance(value, float):
-        if math.isnan(value):
-            return None
-        if value.is_integer():
-            return str(int(value))
-        return str(value).strip()
-    if isinstance(value, (int, np.integer)):
-        return str(int(value))
-    if isinstance(value, str):
-        stripped = value.strip()
-        return stripped or None
-    text = str(value).strip()
-    return text or None
-
-
-def _normalize_player_id(value: Optional[object]) -> Optional[str]:
-    return _coerce_player_id_value(value)
-
-
-def _safe_normalize_player_id(value: Optional[object]) -> Optional[str]:
-    """Gracefully normalize player IDs even if helper isn't available.
-
-    Older local installs may not yet have ``_normalize_player_id`` defined.  When
-    that happens we fall back to the shared coercion logic instead of crashing
-    with a ``NameError``.
-    """
-
-    try:
-        normalizer = _normalize_player_id  # type: ignore[name-defined]
-    except NameError:
-        normalizer = _coerce_player_id_value
-    return normalizer(value)
 
 
 # ----------------------- Player helpers ----------------------
@@ -371,7 +336,7 @@ def _build_lineups(lineups_df: pd.DataFrame,
                         return row.get(c)
                 return None
 
-            id_from_column = _safe_normalize_player_id(_lookup("ID"))
+
             if id_from_column:
                 name_player_id = id_from_column
 
