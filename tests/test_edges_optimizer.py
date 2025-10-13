@@ -1,15 +1,17 @@
+import itertools
 import math
 import os
 import sys
 
 import pandas as pd
+import pytest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from nhl_tools.nhl_optimizer import EdgesOptimizer, ShapePlan
-from nhl_tools.nhl_data import _normalize_opp
+from nhl_tools.nhl_data import DK_ROSTER, _normalize_opp
 
 
 def _sample_pool() -> pd.DataFrame:
@@ -117,3 +119,48 @@ def test_goalie_conflict_with_verbose_opp_strings():
     for idx in lu.indices:
         if pool.loc[idx, "IsSkater"]:
             assert pool.loc[idx, "Opp"] != goalie_team
+
+
+def test_best_projection_ignores_stack_constraints():
+    pool = _sample_pool()
+    cfg = _config()
+    optimizer = EdgesOptimizer(
+        pool,
+        cfg,
+        [ShapePlan([4, 3, 1], primary_mode="ev")],
+        tie_break_random_pct=0.0,
+        bringbacks_enabled=False,
+        max_from_opponent=0,
+        forbid_goalie_conflict=True,
+        salary_min=49500,
+        salary_max=50000,
+        ownership_limits={"max_sum": 300.0, "max_hhi": 0.5},
+    )
+
+    best = optimizer._compute_best_projection()
+
+    expected = 0.0
+    min_c = DK_ROSTER["C"]
+    min_w = DK_ROSTER["W"]
+    min_d = DK_ROSTER["D"]
+    for combo in itertools.combinations(pool.index, 9):
+        subset = pool.loc[list(combo)]
+        salary = subset["Salary"].sum()
+        if salary < 49500 or salary > 50000:
+            continue
+        if subset["IsGoalie"].sum() != 1:
+            continue
+        if subset["IsSkater"].sum() != 8:
+            continue
+        centers = (subset["Pos"] == "C").sum()
+        wings = (subset["Pos"] == "W").sum()
+        defense = (subset["Pos"] == "D").sum()
+        if centers < min_c or centers > min_c + 1:
+            continue
+        if wings < min_w or wings > min_w + 1:
+            continue
+        if defense < min_d or defense > min_d + 1:
+            continue
+        expected = max(expected, subset["Proj"].sum())
+
+    assert best == pytest.approx(expected)
