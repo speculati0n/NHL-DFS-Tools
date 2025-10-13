@@ -106,6 +106,36 @@ def _pp_to_int(s) -> Optional[int]:
         return None
 
 
+def _normalize_opp(value) -> Optional[str]:
+    """Normalize FantasyLabs opponent strings to three-letter abbreviations."""
+
+    if value is None or pd.isna(value):
+        return np.nan
+
+    text = str(value).strip()
+    if not text:
+        return np.nan
+
+    # Strip common FantasyLabs prefixes such as "vs" / "@".
+    text = re.sub(r"^(?:VS\.?|V\.?|@)\s*", "", text, flags=re.IGNORECASE)
+
+    # Truncate at the first whitespace or dash which typically separates
+    # additional notes like starting goalie information.
+    split_match = re.split(r"[\s-]", text, maxsplit=1)
+    abbr = split_match[0] if split_match else text
+
+    abbr = re.sub(r"[^A-Z]", "", abbr.upper())
+    if not abbr:
+        return np.nan
+
+    # Keep standard three-letter team abbreviations.
+    abbr = abbr[:3]
+    if abbr in {"NONE", "NA", "NAN"}:
+        return np.nan
+
+    return abbr
+
+
 def _read_csv_strict(path: str) -> pd.DataFrame:
     """Fallback reader for badly formatted CSVs.
 
@@ -194,7 +224,7 @@ def load_labs_for_date(stats_dir: str, ymd: str) -> pd.DataFrame:
             {
                 "Name": df[c_player].astype(str).str.strip(),
                 "Team": df[c_team].astype(str).str.strip(),
-                "Opp": df[c_opp].astype(str).str.strip() if c_opp else np.nan,
+                "Opp": df[c_opp].map(_normalize_opp) if c_opp else np.nan,
                 "Salary": df[c_sal].map(_coerce_num),
                 "Proj": df[c_proj].map(_coerce_num),
                 "Own": df[c_own].map(_coerce_num) if c_own else np.nan,
@@ -235,6 +265,9 @@ def load_labs_for_date(stats_dir: str, ymd: str) -> pd.DataFrame:
         parts.append(out)
 
     full = pd.concat(parts, ignore_index=True)
+
+    if "Opp" in full.columns:
+        full["Opp"] = full["Opp"].map(_normalize_opp)
 
     # Basic sanity
     full = full.dropna(subset=["Team", "Salary", "Proj", "PosCanon"])
