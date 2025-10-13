@@ -126,12 +126,21 @@ def _read_lineups(path: str) -> pd.DataFrame:
     return df
 
 
-def _extract_slot_value(row: pd.Series, col: str) -> str:
+def _extract_slot_value(row: pd.Series, col: str) -> Tuple[str, Optional[str]]:
     v = row.get(col, "")
-    # allow "Name (123456)" -> "Name"
-    if isinstance(v, str) and "(" in v and v.endswith(")"):
-        return v[: v.rfind("(")].strip()
-    return v
+    pid: Optional[str] = None
+    if isinstance(v, str):
+        value = v.strip()
+        if "(" in value and value.endswith(")"):
+            name_part = value[: value.rfind("(")].strip()
+            id_part = value[value.rfind("(") + 1 : -1].strip()
+            if id_part:
+                pid = id_part
+            return name_part, pid
+        return value, None
+    if v in (None, ""):
+        return "", pid
+    return str(v), pid
 
 
 # ----------------------- Player helpers ----------------------
@@ -301,7 +310,7 @@ def _build_lineups(lineups_df: pd.DataFrame,
     for i, row in lineups_df.iterrows():
         slots: Dict[str, PlayerRecord] = {}
         for col in slot_cols:
-            name = _extract_slot_value(row, col)
+            name, name_player_id = _extract_slot_value(row, col)
             if not isinstance(name, str) or not name.strip():
                 continue
             slot_pos = "G" if col.upper().startswith("G") else \
@@ -344,7 +353,7 @@ def _build_lineups(lineups_df: pd.DataFrame,
                     full=None,
                     pp_unit=None,
                     canonical_name=name,
-                    player_id=None,
+                    player_id=name_player_id,
                 )
                 continue
 
@@ -370,6 +379,8 @@ def _build_lineups(lineups_df: pd.DataFrame,
                 player_id = str(player_id).strip()
                 if not player_id:
                     player_id = None
+            if not player_id and name_player_id:
+                player_id = name_player_id
 
             slots[canonical_slot] = PlayerRecord(
                 name=name, position=str(pos), team=str(team), opp=str(opp) if opp is not None else None,
