@@ -346,8 +346,9 @@ def _build_lineups(lineups_df: pd.DataFrame,
 
             id_from_column = _lookup("ID")
             if id_from_column is not None and not pd.isna(id_from_column):
-
-                name_player_id = id_str or None
+                id_str = _clean_player_id(id_from_column)
+                if id_str:
+                    name_player_id = id_str
 
             ref = choose_ref(name, slot_pos)
             if ref is None:
