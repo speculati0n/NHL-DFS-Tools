@@ -17,6 +17,9 @@ from .nhl_data import (
 # --- Configuration defaults (can be exposed to YAML later) ---
 DEFAULT_NOISE = 5.0  # per-entry gaussian noise to create variance in the simulated field
 DK_SLOTS = ["C1", "C2", "W1", "W2", "W3", "D1", "D2", "G", "UTIL", "UTIL2"]
+DEFAULT_PLAYER_IDS_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), os.pardir, "dk_data", "player_ids.csv")
+)
 
 # ----------------------- Data classes ------------------------
 @dataclass
@@ -133,6 +136,78 @@ def _clean_player_id(raw: Optional[str | float | int]) -> Optional[str]:
     if text in {"", "0", "0.0", "nan", "NaN"}:
         return None
     return text
+
+
+def _first_initial_key(norm_name: str) -> Optional[str]:
+    parts = [p for p in norm_name.split(" ") if p]
+    if len(parts) < 2:
+        return None
+    first, rest = parts[0], parts[1:]
+    if not first:
+        return None
+    return f"{first[0]} {' '.join(rest)}".strip()
+
+
+def _build_player_id_index(path: Optional[str] = None) -> Dict[str, Tuple[str, str]]:
+    if path is None:
+        path = DEFAULT_PLAYER_IDS_PATH
+    try:
+        df = pd.read_csv(path)
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+    cols = {c.lower(): c for c in df.columns}
+    name_col = None
+    for cand in ("name", "player", "full_name", "playername", "dk_name"):
+        if cand in cols:
+            name_col = cols[cand]
+            break
+    id_col = None
+    for cand in ("player_id", "playerid", "dk_id", "draftkings_id", "id"):
+        if cand in cols:
+            id_col = cols[cand]
+            break
+    if not name_col or not id_col:
+        return {}
+
+    index: Dict[str, Tuple[str, str]] = {}
+    initial_candidates: Dict[str, List[Tuple[str, str]]] = {}
+    for _, row in df.iterrows():
+        canon_name = str(row[name_col]).strip()
+        pid = str(row[id_col]).strip()
+        norm = normalize_name(canon_name)
+        if not (norm and pid and canon_name):
+            continue
+        index[norm] = (canon_name, pid)
+        alt = _first_initial_key(norm)
+        if alt and alt not in index:
+            initial_candidates.setdefault(alt, []).append((canon_name, pid))
+
+    for alt, values in initial_candidates.items():
+        uniq = {pid for _, pid in values if pid}
+        if len(uniq) == 1 and alt not in index:
+            index[alt] = values[0]
+
+    return index
+
+
+def _lookup_player_id(
+    idx: Dict[str, Tuple[str, str]], *candidates: Optional[str]
+) -> Tuple[Optional[str], Optional[str]]:
+    if not idx:
+        return None, None
+    for candidate in candidates:
+        if not candidate:
+            continue
+        norm = normalize_name(candidate)
+        if not norm:
+            continue
+        match = idx.get(norm)
+        if match:
+            return match
+    return None, None
 
 
 def _extract_slot_value(row: pd.Series, col: str) -> Tuple[str, Optional[str]]:
@@ -316,6 +391,8 @@ def _build_lineups(lineups_df: pd.DataFrame,
                 best = r
         return best
 
+    player_id_index = _build_player_id_index()
+
     lineups: List[Lineup] = []
     for i, row in lineups_df.iterrows():
         slots: Dict[str, PlayerRecord] = {}
@@ -346,8 +423,17 @@ def _build_lineups(lineups_df: pd.DataFrame,
 
             id_from_column = _lookup("ID")
             if id_from_column is not None and not pd.isna(id_from_column):
+                id_str = _clean_player_id(id_from_column)
+                if id_str:
+                    name_player_id = id_str
 
-                name_player_id = id_str or None
+            map_name, map_pid = _lookup_player_id(player_id_index, name)
+            if map_pid and not name_player_id:
+                name_player_id = _clean_player_id(map_pid)
+            if map_name:
+                mapped_canonical_name = map_name
+            else:
+                mapped_canonical_name = None
 
             ref = choose_ref(name, slot_pos)
             if ref is None:
@@ -357,6 +443,7 @@ def _build_lineups(lineups_df: pd.DataFrame,
                 ceil_val = _lookup("CEIL")
                 team_val = _lookup("TEAM")
                 opp_val = _lookup("OPP")
+                canonical_name = mapped_canonical_name or name
                 slots[canonical_slot] = PlayerRecord(
                     name=name,
                     position=slot_pos,
@@ -367,7 +454,7 @@ def _build_lineups(lineups_df: pd.DataFrame,
                     ceiling=float(ceil_val) if ceil_val not in (None, "") else 0.0,
                     full=None,
                     pp_unit=None,
-                    canonical_name=name,
+                    canonical_name=canonical_name,
                     player_id=name_player_id,
                 )
                 continue
@@ -394,6 +481,12 @@ def _build_lineups(lineups_df: pd.DataFrame,
                 player_id = _clean_player_id(str(player_id))
             if not player_id and name_player_id:
                 player_id = name_player_id
+
+            map_name, map_pid = _lookup_player_id(player_id_index, canon_name, name)
+            if map_pid and not player_id:
+                player_id = _clean_player_id(map_pid)
+            if map_name:
+                canon_name = map_name
 
             slots[canonical_slot] = PlayerRecord(
                 name=name, position=str(pos), team=str(team), opp=str(opp) if opp is not None else None,
