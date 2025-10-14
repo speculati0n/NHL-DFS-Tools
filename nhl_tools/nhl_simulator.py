@@ -126,6 +126,15 @@ def _read_lineups(path: str) -> pd.DataFrame:
     return df
 
 
+def _clean_player_id(raw: Optional[str | float | int]) -> Optional[str]:
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return None
+    text = str(raw).strip()
+    if text in {"", "0", "0.0", "nan", "NaN"}:
+        return None
+    return text
+
+
 def _extract_slot_value(row: pd.Series, col: str) -> Tuple[str, Optional[str]]:
     v = row.get(col, "")
     pid: Optional[str] = None
@@ -134,8 +143,7 @@ def _extract_slot_value(row: pd.Series, col: str) -> Tuple[str, Optional[str]]:
         if "(" in value and value.endswith(")"):
             name_part = value[: value.rfind("(")].strip()
             id_part = value[value.rfind("(") + 1 : -1].strip()
-            if id_part:
-                pid = id_part
+            pid = _clean_player_id(id_part)
             return name_part, pid
         return value, None
     if v in (None, ""):
@@ -336,9 +344,10 @@ def _build_lineups(lineups_df: pd.DataFrame,
                         return row.get(c)
                 return None
 
-
-            if id_from_column:
-                name_player_id = id_from_column
+            id_from_column = _lookup("ID")
+            if id_from_column is not None and not pd.isna(id_from_column):
+                id_str = _clean_player_id(id_from_column)
+                name_player_id = id_str or None
 
             ref = choose_ref(name, slot_pos)
             if ref is None:
@@ -380,11 +389,9 @@ def _build_lineups(lineups_df: pd.DataFrame,
             if pd.isna(player_id):
                 player_id = None
             elif isinstance(player_id, float) and player_id.is_integer():
-                player_id = str(int(player_id))
+                player_id = _clean_player_id(int(player_id))
             else:
-                player_id = str(player_id).strip()
-                if not player_id:
-                    player_id = None
+                player_id = _clean_player_id(str(player_id))
             if not player_id and name_player_id:
                 player_id = name_player_id
 
