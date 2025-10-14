@@ -436,6 +436,11 @@ def _build_lineups(lineups_df: pd.DataFrame,
                 ceil_val = _lookup("CEIL")
                 team_val = _lookup("TEAM")
                 opp_val = _lookup("OPP")
+                mapped_canonical_name, mapped_player_id = _lookup_player_id(
+                    player_id_index, name
+                )
+                if not name_player_id and mapped_player_id:
+                    name_player_id = _clean_player_id(mapped_player_id)
                 canonical_name = mapped_canonical_name or name
                 slots[canonical_slot] = PlayerRecord(
                     name=name,
