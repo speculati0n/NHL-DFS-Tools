@@ -427,13 +427,6 @@ def _build_lineups(lineups_df: pd.DataFrame,
                 if id_str:
                     name_player_id = id_str
 
-            map_name, map_pid = _lookup_player_id(player_id_index, name)
-            if map_pid and not name_player_id:
-                name_player_id = _clean_player_id(map_pid)
-            if map_name:
-                mapped_canonical_name = map_name
-            else:
-                mapped_canonical_name = None
 
             ref = choose_ref(name, slot_pos)
             if ref is None:
