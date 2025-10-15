@@ -10,7 +10,7 @@ NHL → DraftKings-style wide export, mirroring NFL writer behavior:
 
 from __future__ import annotations
 import os, re, unicodedata
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 
 # DraftKings NHL Classic is 9 slots:
@@ -18,6 +18,7 @@ import pandas as pd
 DK_NHL_SLOTS = ["C1","C2","W1","W2","W3","D1","D2","G","UTIL"]
 
 _PUNCT = r"[^\w\s]"
+
 
 def _normalize_name(name: str) -> str:
     s = unicodedata.normalize("NFKD", str(name or ""))
@@ -36,14 +37,31 @@ def _pick(df: pd.DataFrame, *cands: str) -> Optional[str]:
             return cols[c.lower()]
     return None
 
-def _first_initial_key(nm: str) -> Optional[str]:
+def _split_first_rest(nm: str) -> Optional[Tuple[str, str]]:
     parts = [p for p in nm.split(" ") if p]
     if len(parts) < 2:
         return None
     first, rest = parts[0], parts[1:]
-    if not first:
+    remainder = " ".join(rest).strip()
+    if not first or not remainder:
         return None
-    return f"{first[0]} {' '.join(rest)}".strip()
+    return first, remainder
+
+
+def _iter_alias_keys(nm: str) -> Iterable[str]:
+    parts = _split_first_rest(nm)
+    if not parts:
+        return []
+    first, rest = parts
+    aliases = []
+    # First-initial alias (e.g., "c talbot" for "cameron talbot")
+    aliases.append(f"{first[0]} {rest}")
+    # Prefix aliases for shortened first names (e.g., "cam talbot")
+    for length in range(3, len(first)):
+        prefix = first[:length]
+        if prefix != first:
+            aliases.append(f"{prefix} {rest}")
+    return aliases
 
 
 def _build_id_index(ids_df: pd.DataFrame) -> Dict[str, Tuple[str, str]]:
@@ -52,18 +70,18 @@ def _build_id_index(ids_df: pd.DataFrame) -> Dict[str, Tuple[str, str]]:
     if not name_col or not id_col:
         raise ValueError("player_ids.csv must have a name column and a dk id column.")
     idx: Dict[str, Tuple[str, str]] = {}
-    initial_candidates: Dict[str, List[Tuple[str, str]]] = {}
+    alias_candidates: Dict[str, List[Tuple[str, str]]] = {}
     for _, r in ids_df.iterrows():
         nm = _normalize_name(r[name_col])
         pid = str(r[id_col]).strip()
         canon = str(r[name_col]).strip()
         if nm and pid and canon:
             idx[nm] = (canon, pid)
-            alt = _first_initial_key(nm)
-            if alt and alt not in idx:
-                initial_candidates.setdefault(alt, []).append((canon, pid))
+            for alt in _iter_alias_keys(nm):
+                if alt not in idx:
+                    alias_candidates.setdefault(alt, []).append((canon, pid))
 
-    for alt, pids in initial_candidates.items():
+    for alt, pids in alias_candidates.items():
         uniq = {pid for _, pid in pids}
         if len(uniq) == 1 and alt not in idx:
             idx[alt] = pids[0]
