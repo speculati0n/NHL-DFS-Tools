@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import unicodedata
 import re
-from typing import Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import pandas as pd
 
@@ -24,14 +24,29 @@ def _normalize_name(name: str) -> str:
     return s
 
 
-def _first_initial_key(nm: str) -> Optional[str]:
+def _split_first_rest(nm: str) -> Optional[Tuple[str, str]]:
     parts = [p for p in nm.split(" ") if p]
     if len(parts) < 2:
         return None
     first, rest = parts[0], parts[1:]
-    if not first:
+    remainder = " ".join(rest).strip()
+    if not first or not remainder:
         return None
-    return f"{first[0]} {' '.join(rest)}".strip()
+    return first, remainder
+
+
+def _iter_alias_keys(nm: str) -> Iterable[str]:
+    parts = _split_first_rest(nm)
+    if not parts:
+        return []
+    first, rest = parts
+    aliases = []
+    aliases.append(f"{first[0]} {rest}")
+    for length in range(3, len(first)):
+        prefix = first[:length]
+        if prefix != first:
+            aliases.append(f"{prefix} {rest}")
+    return aliases
 
 
 def _build_id_index(path: str) -> Dict[str, Tuple[str, str]]:
@@ -52,18 +67,18 @@ def _build_id_index(path: str) -> Dict[str, Tuple[str, str]]:
     if not name_col or not id_col:
         raise ValueError("player_ids.csv missing name/id columns")
     idx: Dict[str, Tuple[str, str]] = {}
-    initial_candidates: Dict[str, List[Tuple[str, str]]] = {}
+    alias_candidates: Dict[str, List[Tuple[str, str]]] = {}
     for _, row in df.iterrows():
         nm = _normalize_name(row[name_col])
         pid = str(row[id_col]).strip()
         canon = str(row[name_col]).strip()
         if nm and pid and canon:
             idx[nm] = (canon, pid)
-            alt = _first_initial_key(nm)
-            if alt and alt not in idx:
-                initial_candidates.setdefault(alt, []).append((canon, pid))
+            for alt in _iter_alias_keys(nm):
+                if alt not in idx:
+                    alias_candidates.setdefault(alt, []).append((canon, pid))
 
-    for alt, pids in initial_candidates.items():
+    for alt, pids in alias_candidates.items():
         uniq = {pid for _, pid in pids}
         if len(uniq) == 1 and alt not in idx:
             idx[alt] = pids[0]

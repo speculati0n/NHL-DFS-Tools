@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import re
 import unicodedata
-from typing import Dict, Iterable, Tuple, Optional
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 # We build a mapping keyed by normalized (name, team, pos) -> player_id.
 # Supports two input schemas:
@@ -17,12 +17,43 @@ def _safe_str(x) -> str:
 
 def _norm_name(s: str) -> str:
     s = _safe_str(s)
-    s = unicodedata.normalize("NFKD", s).encode("ascii","ignore").decode("ascii")
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
     s = re.sub(r"[^\w\s]", "", s)
     s = re.sub(r"\s+", " ", s).strip().lower()
     # drop suffixes
     s = re.sub(r"\b(jr|sr|ii|iii|iv)\b\.?", "", s).strip()
     return s
+
+
+def _split_first_rest(nm: str) -> Optional[Tuple[str, str]]:
+    parts = [p for p in nm.split(" ") if p]
+    if len(parts) < 2:
+        return None
+    first, rest = parts[0], parts[1:]
+    remainder = " ".join(rest).strip()
+    if not first or not remainder:
+        return None
+    return first, remainder
+
+
+def _iter_name_aliases(nm: str) -> List[str]:
+    parts = _split_first_rest(nm)
+    if not parts:
+        return []
+    first, rest = parts
+    aliases = [f"{first[0]} {rest}"]
+    for length in range(3, len(first)):
+        prefix = first[:length]
+        if prefix != first:
+            aliases.append(f"{prefix} {rest}")
+    # Deduplicate while preserving order
+    seen = set()
+    uniq_aliases = []
+    for alias in aliases:
+        if alias not in seen:
+            seen.add(alias)
+            uniq_aliases.append(alias)
+    return uniq_aliases
 
 def _key(name: str, team: str, pos: str) -> str:
     return f"{_norm_name(name)}|{_safe_str(team).strip().upper()}|{_safe_str(pos).strip().upper()}"
@@ -56,16 +87,30 @@ def _detect_schema(fieldnames: Iterable[str]) -> str:
             return "dk"
     return "unknown"
 
-def _load_simple(reader: csv.DictReader) -> Dict[str,str]:
-    mp: Dict[str,str] = {}
+def _load_simple(reader: csv.DictReader) -> Dict[str, str]:
+    mp: Dict[str, str] = {}
+    canonical_entries: List[Tuple[str, str, str, str]] = []  # (name_norm, team, pos, pid)
     for row in reader:
-        pid = _safe_str(row.get("player_id","")).strip()
-        name = _safe_str(row.get("name","")).strip()
-        team = _safe_str(row.get("team","")).strip().upper()
-        pos  = _safe_str(row.get("pos","")).strip().upper()
+        pid = _safe_str(row.get("player_id", "")).strip()
+        name = _safe_str(row.get("name", "")).strip()
+        team = _safe_str(row.get("team", "")).strip().upper()
+        pos = _safe_str(row.get("pos", "")).strip().upper()
         if not (pid and name and team and pos):
             continue
-        mp[_key(name, team, pos)] = pid
+        key = _key(name, team, pos)
+        mp[key] = pid
+        canonical_entries.append((_norm_name(name), team, pos, pid))
+
+    alias_candidates: Dict[str, Set[str]] = {}
+    for name_norm, team, pos, pid in canonical_entries:
+        for alias in _iter_name_aliases(name_norm):
+            alias_key = f"{alias}|{team}|{pos}"
+            if alias_key not in mp:
+                alias_candidates.setdefault(alias_key, set()).add(pid)
+
+    for alias_key, pid_set in alias_candidates.items():
+        if len(pid_set) == 1 and alias_key not in mp:
+            mp[alias_key] = next(iter(pid_set))
     return mp
 
 def _load_dk(reader: csv.DictReader) -> Dict[str,str]:
@@ -77,7 +122,8 @@ def _load_dk(reader: csv.DictReader) -> Dict[str,str]:
       - TeamAbbrev (e.g., EDM, TOR)
       - Position or Roster Position (can be single or multi like 'C/W')
     """
-    mp: Dict[str,str] = {}
+    mp: Dict[str, str] = {}
+    alias_entries: List[Tuple[str, str, str, str]] = []
     for row in reader:
         name = _safe_str(row.get("Name","")).strip()
         pid  = _safe_str(row.get("ID","")).strip()
@@ -88,6 +134,7 @@ def _load_dk(reader: csv.DictReader) -> Dict[str,str]:
             # Skip incomplete rows
             continue
 
+        name_norm = _norm_name(name)
         keys = list(_keys_for_multi_elig(name, team, rawp))
         if not keys:
             # If we couldn't parse a position, attempt to infer one letter from raw string
@@ -101,7 +148,23 @@ def _load_dk(reader: csv.DictReader) -> Dict[str,str]:
 
         for k in keys:
             # Prefer first occurrence (avoid overriding with duplicates)
-            mp.setdefault(k, pid)
+            if k not in mp:
+                mp[k] = pid
+                parts = k.split("|")
+                if len(parts) == 3:
+                    _, team_part, pos_part = parts
+                    alias_entries.append((name_norm, team_part, pos_part, pid))
+
+    alias_candidates: Dict[str, Set[str]] = {}
+    for name_norm, team, pos, pid in alias_entries:
+        for alias in _iter_name_aliases(name_norm):
+            alias_key = f"{alias}|{team}|{pos}"
+            if alias_key not in mp:
+                alias_candidates.setdefault(alias_key, set()).add(pid)
+
+    for alias_key, pid_set in alias_candidates.items():
+        if len(pid_set) == 1 and alias_key not in mp:
+            mp[alias_key] = next(iter(pid_set))
     return mp
 
 def load_player_ids_any(path: str) -> Dict[str,str]:
