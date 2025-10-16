@@ -80,30 +80,14 @@ def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
     proj_col = get("Projection", "Proj", "My Proj", "proj", "points", default="Projection")
     own_col  = get("Ownership", "Own%", "My Own", "own", "ownership", default=None)
 
-    rename_map = {}
-
-    def schedule_rename(src: str, dest: str) -> None:
-        if src == dest:
-            return
-        if src not in df.columns:
-            return
-        # If the destination column already exists (e.g. both "Pos" and
-        # "Roster Position" in the input), drop it so the canonical column we
-        # prefer replaces it instead of creating a duplicate which would later
-        # behave like a DataFrame when accessed.
-        if dest in df.columns:
-            df.drop(columns=[dest], inplace=True)
-        rename_map[src] = dest
-
-    schedule_rename(name_col, "Name")
-    schedule_rename(id_col, "ID")
-    schedule_rename(team_col, "Team")
-    schedule_rename(opp_col, "Opp")
-    schedule_rename(pos_col, "Pos")
-    schedule_rename(sal_col, "Salary")
-
-    if rename_map:
-        df.rename(columns=rename_map, inplace=True)
+    df.rename(columns={
+        name_col: "Name",
+        id_col: "ID",
+        team_col: "Team",
+        opp_col: "Opp",
+        pos_col: "Pos",
+        sal_col: "Salary"
+    }, inplace=True)
 
     if proj_col and proj_col in df.columns:
         df.rename(columns={proj_col: "Projection"}, inplace=True)
