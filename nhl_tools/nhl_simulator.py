@@ -13,6 +13,7 @@ from .nhl_data import (
     normalize_name,
     load_player_reference_for_date,
 )
+from .id_map import apply_name_id_mapping
 
 # --- Configuration defaults (can be exposed to YAML later) ---
 DEFAULT_NOISE = 5.0  # per-entry gaussian noise to create variance in the simulated field
@@ -789,11 +790,14 @@ def _write_outputs(
     lineups_table: pd.DataFrame,
     player_exposure: pd.DataFrame,
     stack_exposure: pd.DataFrame,
+    player_ids_df: Optional[pd.DataFrame] = None,
 ) -> None:
     os.makedirs(outdir, exist_ok=True)
     lineups_out = os.path.join(outdir, f"DK_gpp_sim_lineups_{field_size}_{iterations}.csv")
     players_out = os.path.join(outdir, f"DK_gpp_sim_player_exposure_{field_size}_{iterations}.csv")
     stacks_out = os.path.join(outdir, f"DK_gpp_sim_stack_exposure_{field_size}_{iterations}.csv")
+    if player_ids_df is not None and not player_ids_df.empty:
+        lineups_table = apply_name_id_mapping(lineups_table, player_ids_df)
     lineups_table.to_csv(lineups_out, index=False)
     player_exposure.to_csv(players_out, index=False)
     stack_exposure.to_csv(stacks_out, index=False)
@@ -813,8 +817,27 @@ def main(args: argparse.Namespace) -> None:
     player_exposure = _player_exposure_table(lineups, sim, args.field_size, args.iterations)
     stack_exposure = _stack_exposure_table(sim)
 
-    _write_outputs(args.outdir, args.field_size, args.iterations,
-                   lineups_df, players_df, lineups_table, player_exposure, stack_exposure)
+    player_ids_df: Optional[pd.DataFrame] = None
+    player_ids_path = getattr(args, "player_ids", None)
+    if player_ids_path:
+        try:
+            player_ids_df = pd.read_csv(player_ids_path)
+        except FileNotFoundError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read player IDs from {player_ids_path}: {exc}") from exc
+
+    _write_outputs(
+        args.outdir,
+        args.field_size,
+        args.iterations,
+        lineups_df,
+        players_df,
+        lineups_table,
+        player_exposure,
+        stack_exposure,
+        player_ids_df=player_ids_df,
+    )
 
 
 if __name__ == "__main__":
