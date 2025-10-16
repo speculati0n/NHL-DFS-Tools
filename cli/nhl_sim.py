@@ -50,12 +50,32 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Suppress verbose logging (only errors)",
     )
+    parser.add_argument(
+        "--player-ids",
+        default=None,
+        help=(
+            "Path to player_ids.csv (with columns Name, ID, Roster Position). "
+            "If omitted, will use dk_data/player_ids.csv if present."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     _ensure_repo_on_path()
     args = _parse_args(argv)
+
+    player_ids_path = args.player_ids
+    if not player_ids_path:
+        candidate = os.path.join("dk_data", "player_ids.csv")
+        player_ids_path = candidate if os.path.exists(candidate) else None
+
+    if player_ids_path is None or not os.path.exists(player_ids_path):
+        raise FileNotFoundError(
+            "player_ids.csv not found. Provide --player-ids or place dk_data/player_ids.csv"
+        )
+
+    args.player_ids = player_ids_path
 
     from nhl_tools.nhl_simulator import main as sim_main
 
